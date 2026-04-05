@@ -18,9 +18,11 @@ import subprocess
 import tempfile
 import threading
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from pathlib import Path
-from typing import Callable, Dict, Optional, Any
+from typing import Callable, Dict, List, Optional, Any, Set
+from dataclasses import dataclass, field
+import aiohttp
 
 logger = logging.getLogger(__name__)
 
@@ -458,6 +460,30 @@ class DiscordAdapter(BasePlatformAdapter):
         # Reply threading mode: "off" (no replies), "first" (reply on first
         # chunk only, default), "all" (reply-reference on every chunk).
         self._reply_to_mode: str = getattr(config, 'reply_to_mode', 'first') or 'first'
+        # Smart auto-threading: track per-channel interaction counts.
+        # Key: channel_id, Value: list of timestamps (monotonic) of recent interactions.
+        self._channel_interactions: Dict[str, List[float]] = {}
+        # How many back-and-forth messages before auto-creating a thread.
+        self._auto_thread_threshold = int(os.getenv("DISCORD_AUTO_THREAD_THRESHOLD", "3"))
+
+        # ── Ambient mode: smart classifier-driven response ─────────────────────
+        # Per-channel ring buffers for conversation context
+        self._channel_context: Dict[str, deque] = defaultdict(
+            lambda: deque(maxlen=20)
+        )
+        # Ambient channel IDs that Rilo watches silently
+        self._ambient_channels: Set[str] = set(
+            ch.strip() for ch in os.getenv("DISCORD_AMBIENT_CHANNELS", "").split(",")
+            if ch.strip()
+        )
+        self._ambient_enabled = os.getenv("DISCORD_AMBIENT_ENABLED", "false").lower() in ("true", "1", "yes")
+        self._ambient_classifier_url = os.getenv("DISCORD_AMBIENT_CLASSIFIER_URL", "").rstrip("/")
+        # Feedback tracking: message_id -> context (for reaction monitoring)
+        self._ambient_pending_feedback: Dict[str, dict] = {}
+        self._feedback_check_interval = float(os.getenv("DISCORD_AMBIENT_FEEDBACK_WINDOW", "300"))
+        # Track the last ambient response so send() can hook in feedback collection
+        self._pending_ambient_response: Optional[Dict[str, str]] = None  # {chat_id, message_text}
+        logger.info("[DISCORD ADAPTER INIT] ambient_enabled=%s channels=%s", self._ambient_enabled, self._ambient_channels)
 
     async def connect(self) -> bool:
         """Connect to Discord and start receiving events."""
@@ -813,6 +839,28 @@ class DiscordAdapter(BasePlatformAdapter):
                     else:
                         raise
                 message_ids.append(str(msg.id))
+
+            # Ambient feedback: schedule collector if this was an ambient response
+            if (
+                self._pending_ambient_response
+                and self._pending_ambient_response.get("channel_id") == chat_id
+            ):
+                first_msg_id = message_ids[0] if message_ids else None
+                if first_msg_id:
+                    pending = self._pending_ambient_response
+                    asyncio.create_task(
+                        self._collect_feedback(
+                            sent_message_id=first_msg_id,
+                            original_message_text=pending["message_text"],
+                            channel_id=pending["channel_id"],
+                        )
+                    )
+                    logger.info(
+                        "[%s] Scheduled feedback collection for ambient message %s",
+                        self.name,
+                        first_msg_id,
+                    )
+                self._pending_ambient_response = None
 
             return SendResult(
                 success=True,
@@ -1410,8 +1458,9 @@ class DiscordAdapter(BasePlatformAdapter):
                     except asyncio.CancelledError:
                         return
                     except Exception as e:
+                        # Don't kill the loop on transient failures — keep the typing
+                        # indicator alive so Discord doesn't show phantom "stopped typing"
                         logger.debug("Discord typing indicator failed for %s: %s", chat_id, e)
-                        return
                     await asyncio.sleep(8)
             except asyncio.CancelledError:
                 pass
@@ -2228,6 +2277,7 @@ class DiscordAdapter(BasePlatformAdapter):
             thread_id = str(message.channel.id)
             parent_channel_id = self._get_parent_channel_id(message.channel)
 
+        is_ambient = False  # default for DMs; overridden below for server channels
         if not isinstance(message.channel, discord.DMChannel):
             # Check ignored channels first - never respond even when mentioned
             ignored_channels_raw = os.getenv("DISCORD_IGNORED_CHANNELS", "")
@@ -2246,12 +2296,17 @@ class DiscordAdapter(BasePlatformAdapter):
 
             require_mention = os.getenv("DISCORD_REQUIRE_MENTION", "true").lower() not in ("false", "0", "no")
             is_free_channel = bool(channel_ids & free_channels)
+            # Ambient channels bypass the mention requirement — they use the classifier instead
+            is_ambient = (
+                self._ambient_enabled
+                and str(message.channel.id) in self._ambient_channels
+            )
 
             # Skip the mention check if the message is in a thread where
             # the bot has previously participated (auto-created or replied in).
             in_bot_thread = is_thread and thread_id in self._bot_participated_threads
 
-            if require_mention and not is_free_channel and not in_bot_thread:
+            if require_mention and not is_free_channel and not in_bot_thread and not is_ambient:
                 if self._client.user not in message.mentions:
                     return
 
@@ -2259,17 +2314,66 @@ class DiscordAdapter(BasePlatformAdapter):
                 message.content = message.content.replace(f"<@{self._client.user.id}>", "").strip()
                 message.content = message.content.replace(f"<@!{self._client.user.id}>", "").strip()
 
-        # Auto-thread: when enabled, automatically create a thread for every
-        # @mention in a text channel so each conversation is isolated (like Slack).
-        # Messages already inside threads or DMs are unaffected.
-        # no_thread_channels: channels where bot responds directly without thread.
+        # ── Ambient mode: classifier check for silent channels ─────────────────────
+        _was_mentioned = (
+            self._client.user in message.mentions
+            if (self._client.user and not isinstance(message.channel, discord.DMChannel))
+            else True  # DMs always count as "mentioned"
+        )
+
+        if is_ambient and not _was_mentioned:
+            ch_id = str(message.channel.id)
+            self._channel_context[ch_id].append(message.content)
+
+            should_respond = await self._ambient_classify(
+                message.content,
+                list(self._channel_context[ch_id]),
+                message.id,
+                ch_id,
+                str(message.author.id),
+            )
+
+            if not should_respond:
+                logger.debug(
+                    "[%s] Ambient skip (classifier): %s",
+                    self.name,
+                    message.content[:80],
+                )
+                return  # Stay silent
+
+            logger.info(
+                "[%s] Ambient: responding to '%s...'",
+                self.name,
+                message.content[:60],
+            )
+            self._pending_ambient_response = {
+                "channel_id": ch_id,
+                "message_text": message.content,
+            }
+
+        # Auto-thread: configurable behavior for threading in channels.
         auto_threaded_channel = None
         if not is_thread and not isinstance(message.channel, discord.DMChannel):
             no_thread_channels_raw = os.getenv("DISCORD_NO_THREAD_CHANNELS", "")
             no_thread_channels = {ch.strip() for ch in no_thread_channels_raw.split(",") if ch.strip()}
             skip_thread = bool(channel_ids & no_thread_channels)
-            auto_thread = os.getenv("DISCORD_AUTO_THREAD", "true").lower() in ("true", "1", "yes")
-            if auto_thread and not skip_thread:
+            auto_thread_mode = os.getenv("DISCORD_AUTO_THREAD", "smart").lower()
+            should_thread = False
+
+            if auto_thread_mode in ("true", "1", "yes", "always") and not skip_thread:
+                should_thread = True
+            elif auto_thread_mode == "smart" and not skip_thread:
+                ch_id = str(message.channel.id)
+                now = time.monotonic()
+                interactions = self._channel_interactions.get(ch_id, [])
+                interactions = [t for t in interactions if now - t < 1800]
+                interactions.append(now)
+                self._channel_interactions[ch_id] = interactions
+                if len(interactions) >= self._auto_thread_threshold:
+                    should_thread = True
+                    self._channel_interactions[ch_id] = []
+
+            if should_thread:
                 thread = await self._auto_create_thread(message)
                 if thread:
                     is_thread = True
@@ -2453,6 +2557,139 @@ class DiscordAdapter(BasePlatformAdapter):
             self._track_thread(thread_id)
 
         await self.handle_message(event)
+
+    # ── Ambient Classifier ────────────────────────────────────────────────────
+
+    async def _ambient_classify(
+        self,
+        message_text: str,
+        context: list,
+        message_id: str,
+        channel_id: str,
+        author_id: str,
+    ) -> bool:
+        """
+        Call the ambient classifier API. Returns True if Rilo should respond.
+        """
+        if not self._ambient_classifier_url:
+            logger.warning("[%s] Ambient enabled but no classifier URL configured", self.name)
+            return False
+
+        try:
+            payload = {
+                "message": message_text,
+                "message_id": message_id,
+                "context": context[-10:],  # last 10 messages for context
+                "channel_id": channel_id,
+                "author_id": author_id,
+            }
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{self._ambient_classifier_url}/classify",
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as resp:
+                    if resp.status == 422:
+                        # Classifier couldn't parse the request — fail open (respond)
+                        logger.warning(
+                            "[%s] Ambient classifier returned 422 (parse error) — failing open",
+                            self.name,
+                        )
+                        return True
+                    if resp.status != 200:
+                        logger.warning(
+                            "[%s] Ambient classifier returned %s",
+                            self.name,
+                            resp.status,
+                        )
+                        return False
+                    result = await resp.json()
+                    return result.get("respond", False)
+        except asyncio.TimeoutError:
+            logger.warning("[%s] Ambient classifier timed out", self.name)
+            return False
+        except Exception as e:
+            logger.error(
+                "[%s] Ambient classifier error: %s",
+                self.name,
+                e,
+                exc_info=True,
+            )
+            return False
+
+    async def _collect_feedback(self, sent_message_id: str, original_message_text: str, channel_id: str):
+        """
+        Watch for reactions on a sent message for self._feedback_check_interval seconds.
+        Then send feedback to the classifier API based on what we observed.
+        """
+        await asyncio.sleep(self._feedback_check_interval)
+
+        try:
+            if not self._client:
+                return
+            channel = self._client.get_channel(int(channel_id))
+            if not channel:
+                channel = await self._client.fetch_channel(int(channel_id))
+            if not channel:
+                return
+
+            msg = await channel.fetch_message(int(sent_message_id))
+        except Exception as e:
+            logger.debug("[%s] Could not fetch message for feedback: %s", self.name, e)
+            return
+
+        # Check reactions
+        thumbs_up = None
+        thumbs_down = None
+        for reaction in msg.reactions:
+            emoji = str(reaction.emoji)
+            if emoji in ("👍", "👍🏻", "👍🏼", "👍🏽", "👍🏾", "👍🏿", "thumbsup"):
+                thumbs_up = reaction.count
+            elif emoji in ("👎", "👎🏻", "👎🏼", "👎🏽", "👎🏾", "👎🏿", "thumbsdown"):
+                thumbs_down = reaction.count
+
+        # Determine feedback
+        label = None
+        signal_type = None
+
+        if thumbs_up and thumbs_up > 1:  # >1 because bot's own reaction counts
+            label = "respond"
+            signal_type = "implicit_positive"
+        elif thumbs_down and thumbs_down > 1:
+            label = "ignore"
+            signal_type = "implicit_negative"
+        else:
+            # No clear signal — check if message got any replies from the user
+            # For now, default to "no signal" — skip feedback
+            label = None
+            signal_type = "no_signal"
+
+        if label and self._ambient_classifier_url:
+            try:
+                payload = {
+                    "message_id": sent_message_id,
+                    "label": label,
+                    "signal_type": signal_type,
+                    "message_text": original_message_text,
+                    "context": list(self._channel_context.get(channel_id, [])),
+                    "channel_id": channel_id,
+                }
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(
+                        f"{self._ambient_classifier_url}/feedback",
+                        json=payload,
+                        timeout=aiohttp.ClientTimeout(total=5),
+                    ) as resp:
+                        if resp.status == 200:
+                            result = await resp.json()
+                            logger.info(
+                                "[%s] Feedback stored: %s (total examples: %d)",
+                                self.name,
+                                signal_type,
+                                result.get("total_examples", "?"),
+                            )
+            except Exception as e:
+                logger.debug("[%s] Feedback send failed: %s", self.name, e)
 
 
 # ---------------------------------------------------------------------------
