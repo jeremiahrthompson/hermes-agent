@@ -1,0 +1,10 @@
+name: chromadb
+version: 1.0.0
+description: "ChromaDB-backed vector memory — semantic search, composite scoring, team memory, memory consolidation, and multi-agent collection segregation."
+pip_dependencies:
+  - chromadb
+hooks:
+  - on_session_end
+  - on_pre_compress
+  - on_memory_write
+  - on_delegation
