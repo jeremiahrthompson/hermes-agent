@@ -1024,7 +1024,7 @@ DEFAULT_CONFIG = {
     },
 
     # Config schema version - bump this when adding new required fields
-    "_config_version": 22,
+    "_config_version": 23,
 }
 
 # =============================================================================
@@ -2336,7 +2336,7 @@ _KNOWN_ROOT_KEYS = {
     "fallback_providers", "credential_pool_strategies", "toolsets",
     "agent", "terminal", "display", "compression", "delegation",
     "auxiliary", "custom_providers", "context", "memory", "gateway",
-    "sessions",
+    "sessions", "image_gen",
 }
 
 # Valid fields inside a custom_providers list entry
@@ -2889,6 +2889,41 @@ def migrate_config(interactive: bool = True, quiet: bool = False) -> Dict[str, A
                         "  ✓ Plugins now opt-in: no existing plugins to grandfather. "
                         "Use `hermes plugins enable <name>` to activate."
                     )
+
+    # ── Version 22 → 23: migrate legacy image_generation: → image_gen: ──
+    # Local fork carried a hand-rolled OpenRouter+FAL image_generation block.
+    # Upstream now ships pluggable image_gen backends (plugins/image_gen/*).
+    # Preserve any custom model setting; default to the openai-codex plugin
+    # which uses the existing Codex OAuth (no extra credentials).
+    if current_ver < 23:
+        config = read_raw_config()
+        legacy = config.get("image_generation")
+        new = config.get("image_gen")
+        if isinstance(legacy, dict) and not isinstance(new, dict):
+            legacy_provider = str(legacy.get("provider") or "").strip().lower()
+            legacy_model = str(legacy.get("model") or "").strip()
+            new_block: Dict[str, Any] = {"provider": "openai-codex"}
+            # If the legacy model looks like a gpt-image-2 tier ID, preserve it.
+            # Otherwise leave model unset and let the plugin pick its default.
+            if legacy_model.startswith("gpt-image-2"):
+                new_block["model"] = legacy_model
+            config["image_gen"] = new_block
+            del config["image_generation"]
+            save_config(config)
+            results["config_added"].append(
+                f"image_gen.provider=openai-codex (migrated from image_generation.provider={legacy_provider or 'unset'})"
+            )
+            if not quiet:
+                print(
+                    f"  ✓ Migrated image_generation → image_gen.provider=openai-codex "
+                    f"(was image_generation.provider={legacy_provider or 'unset'})"
+                )
+        elif isinstance(legacy, dict) and isinstance(new, dict):
+            # Both present — drop legacy, keep new
+            del config["image_generation"]
+            save_config(config)
+            if not quiet:
+                print("  ✓ Removed redundant image_generation: block (image_gen: already set)")
 
     if current_ver < latest_ver and not quiet:
         print(f"Config version: {current_ver} → {latest_ver}")
