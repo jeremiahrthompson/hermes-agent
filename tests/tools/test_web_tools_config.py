@@ -279,50 +279,51 @@ class TestBackendSelection:
 
     # ── Config-based selection (web.backend in config.yaml) ───────────
 
-    def test_config_parallel(self):
-        """web.backend=parallel in config → 'parallel' regardless of keys."""
+    def test_config_parallel_without_key_falls_back_to_direct(self):
+        """Configured Parallel without credentials should fall back to direct."""
         from tools.web_tools import _get_backend
         with patch("tools.web_tools._load_web_config", return_value={"backend": "parallel"}):
-            assert _get_backend() == "parallel"
+            assert _get_backend() == "direct"
 
-    def test_config_exa(self):
-        """web.backend=exa in config → 'exa' regardless of other keys."""
+    def test_config_exa_without_key_falls_back_to_direct(self):
+        """Configured Exa without credentials should fall back to direct even if other keys exist."""
         from tools.web_tools import _get_backend
         with patch("tools.web_tools._load_web_config", return_value={"backend": "exa"}), \
              patch.dict(os.environ, {"PARALLEL_API_KEY": "test-key"}):
-            assert _get_backend() == "exa"
+            assert _get_backend() == "direct"
 
-    def test_config_firecrawl(self):
-        """web.backend=firecrawl in config → 'firecrawl' even if Parallel key set."""
+    def test_config_firecrawl_without_key_falls_back_to_direct(self):
+        """Configured Firecrawl without credentials should fall back to direct even if other keys exist."""
         from tools.web_tools import _get_backend
         with patch("tools.web_tools._load_web_config", return_value={"backend": "firecrawl"}), \
              patch.dict(os.environ, {"PARALLEL_API_KEY": "test-key"}):
-            assert _get_backend() == "firecrawl"
-
-    def test_config_tavily(self):
-        """web.backend=tavily in config → 'tavily' regardless of other keys."""
-        from tools.web_tools import _get_backend
-        with patch("tools.web_tools._load_web_config", return_value={"backend": "tavily"}):
-            assert _get_backend() == "tavily"
-
-    def test_config_tavily_overrides_env_keys(self):
-        """web.backend=tavily in config → 'tavily' even if Firecrawl key set."""
-        from tools.web_tools import _get_backend
-        with patch("tools.web_tools._load_web_config", return_value={"backend": "tavily"}), \
-             patch.dict(os.environ, {"FIRECRAWL_API_KEY": "fc-test"}):
-            assert _get_backend() == "tavily"
+            assert _get_backend() == "direct"
 
     def test_config_case_insensitive(self):
         """web.backend=Parallel (mixed case) → 'parallel'."""
         from tools.web_tools import _get_backend
-        with patch("tools.web_tools._load_web_config", return_value={"backend": "Parallel"}):
+        with patch("tools.web_tools._load_web_config", return_value={"backend": "Parallel"}), \
+             patch.dict(os.environ, {"PARALLEL_API_KEY": "test-key"}):
             assert _get_backend() == "parallel"
 
-    def test_config_tavily_case_insensitive(self):
-        """web.backend=Tavily (mixed case) → 'tavily'."""
+    def test_config_tavily_without_key_falls_back_to_direct(self):
+        """Configured Tavily without credentials should fall back to keyless direct mode."""
+        from tools.web_tools import _get_backend
+        with patch("tools.web_tools._load_web_config", return_value={"backend": "tavily"}):
+            assert _get_backend() == "direct"
+
+    def test_config_tavily_with_key_stays_tavily(self):
+        """Configured Tavily with credentials should continue using Tavily."""
+        from tools.web_tools import _get_backend
+        with patch("tools.web_tools._load_web_config", return_value={"backend": "tavily"}), \
+             patch.dict(os.environ, {"TAVILY_API_KEY": "tvly-test"}):
+            assert _get_backend() == "tavily"
+
+    def test_config_tavily_case_insensitive_without_key_falls_back_to_direct(self):
+        """Mixed-case configured Tavily without credentials should fall back to direct."""
         from tools.web_tools import _get_backend
         with patch("tools.web_tools._load_web_config", return_value={"backend": "Tavily"}):
-            assert _get_backend() == "tavily"
+            assert _get_backend() == "direct"
 
     # ── Fallback (no web.backend in config) ───────────────────────────
 
@@ -383,11 +384,11 @@ class TestBackendSelection:
              patch.dict(os.environ, {"FIRECRAWL_API_KEY": "fc-test"}):
             assert _get_backend() == "firecrawl"
 
-    def test_fallback_no_keys_defaults_to_firecrawl(self):
-        """No keys, no config → 'firecrawl' (will fail at client init)."""
+    def test_fallback_no_keys_defaults_to_direct(self):
+        """No keys, no config → 'direct' keyless fallback."""
         from tools.web_tools import _get_backend
         with patch("tools.web_tools._load_web_config", return_value={}):
-            assert _get_backend() == "firecrawl"
+            assert _get_backend() == "direct"
 
     def test_invalid_config_falls_through_to_fallback(self):
         """web.backend=invalid → ignored, uses key-based fallback."""
@@ -532,9 +533,9 @@ class TestCheckWebApiKey:
             from tools.web_tools import check_web_api_key
             assert check_web_api_key() is True
 
-    def test_no_keys_returns_false(self):
+    def test_no_keys_returns_true(self):
         from tools.web_tools import check_web_api_key
-        assert check_web_api_key() is False
+        assert check_web_api_key() is True
 
     def test_both_keys_returns_true(self):
         with patch.dict(os.environ, {
@@ -558,12 +559,13 @@ class TestCheckWebApiKey:
             from tools.web_tools import check_web_api_key
             assert check_web_api_key() is True
 
-    def test_configured_backend_must_match_available_provider(self):
+    def test_configured_backend_without_provider_uses_direct_fallback(self):
         with patch("tools.web_tools._load_web_config", return_value={"backend": "parallel"}):
             with patch("tools.web_tools._read_nous_access_token", return_value="nous-token"):
                 with patch.dict(os.environ, {"FIRECRAWL_GATEWAY_URL": "http://127.0.0.1:3002"}, clear=False):
-                    from tools.web_tools import check_web_api_key
-                    assert check_web_api_key() is False
+                    from tools.web_tools import check_web_api_key, _get_backend
+                    assert check_web_api_key() is True
+                    assert _get_backend() == "direct"
 
     def test_configured_firecrawl_backend_accepts_managed_gateway(self):
         with patch("tools.web_tools._load_web_config", return_value={"backend": "firecrawl"}):
