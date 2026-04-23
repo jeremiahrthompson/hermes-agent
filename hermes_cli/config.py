@@ -2804,7 +2804,7 @@ _KNOWN_ROOT_KEYS = {
     "fallback_providers", "credential_pool_strategies", "toolsets",
     "agent", "terminal", "display", "compression", "delegation",
     "auxiliary", "custom_providers", "context", "memory", "gateway",
-    "sessions",
+    "sessions", "image_gen",
 }
 
 # Valid fields inside a custom_providers list entry
@@ -3391,17 +3391,6 @@ def migrate_config(interactive: bool = True, quiet: bool = False) -> Dict[str, A
     # read time, so the curator *functions*; but users can't see/edit the
     # settings in their `config.yaml`, and `hermes curator status` has no
     # stable logs dir to point at until the first run mkdir's it.
-    #
-    # This migration:
-    #   1. Writes the `curator` top-level section to config.yaml (enabled,
-    #      interval_hours, min_idle_hours, stale_after_days, archive_after_days)
-    #      — only keys the user hasn't already overridden.
-    #   2. Writes the `auxiliary.curator` aux-task slot (provider, model,
-    #      base_url, api_key, timeout, extra_body) — canonical slot for
-    #      routing the curator fork to a cheaper aux model.
-    #   3. Creates `~/.hermes/logs/curator/` if missing (belt-and-suspenders
-    #      on top of ensure_hermes_home() — old profiles that predate this
-    #      migration still benefit).
     if current_ver < 23:
         try:
             curator_dir = get_hermes_home() / "logs" / "curator"
@@ -3446,6 +3435,30 @@ def migrate_config(interactive: bool = True, quiet: bool = False) -> Dict[str, A
             config["auxiliary"] = raw_aux
             touched = True
 
+        # (3) Local fork migration: legacy image_generation: → image_gen:
+        # Upstream now ships pluggable image_gen backends. Preserve a custom
+        # gpt-image-2 model if present; otherwise let the openai-codex plugin
+        # choose its default and remove the deprecated block.
+        legacy = config.get("image_generation")
+        new = config.get("image_gen")
+        migrated_image_gen = False
+        removed_legacy_image_generation = False
+        legacy_provider = "unset"
+        if isinstance(legacy, dict) and not isinstance(new, dict):
+            legacy_provider = str(legacy.get("provider") or "").strip().lower() or "unset"
+            legacy_model = str(legacy.get("model") or "").strip()
+            new_block: Dict[str, Any] = {"provider": "openai-codex"}
+            if legacy_model.startswith("gpt-image-2"):
+                new_block["model"] = legacy_model
+            config["image_gen"] = new_block
+            del config["image_generation"]
+            migrated_image_gen = True
+            touched = True
+        elif isinstance(legacy, dict) and isinstance(new, dict):
+            del config["image_generation"]
+            removed_legacy_image_generation = True
+            touched = True
+
         if touched:
             save_config(config)
             if added_curator:
@@ -3466,6 +3479,18 @@ def migrate_config(interactive: bool = True, quiet: bool = False) -> Dict[str, A
                         "  ✓ Seeded auxiliary.curator defaults in config.yaml: "
                         f"{', '.join(added_aux)}"
                     )
+            if migrated_image_gen:
+                results["config_added"].append(
+                    f"image_gen.provider=openai-codex (migrated from image_generation.provider={legacy_provider})"
+                )
+                if not quiet:
+                    print(
+                        "  ✓ Migrated image_generation → image_gen.provider=openai-codex "
+                        f"(was image_generation.provider={legacy_provider})"
+                    )
+            if removed_legacy_image_generation and not quiet:
+                print("  ✓ Removed redundant image_generation: block (image_gen: already set)")
+
 
     if current_ver < latest_ver and not quiet:
         print(f"Config version: {current_ver} → {latest_ver}")
