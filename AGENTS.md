@@ -2,6 +2,13 @@
 
 Instructions for AI coding assistants and developers working on the hermes-agent codebase.
 
+## Repository Ownership
+
+- Canonical writable fork: `sumofagents/hermes-agent`
+- Origin URL: `https://github.com/sumofagents/hermes-agent.git`
+- Upstream source: `https://github.com/NousResearch/hermes-agent.git`
+- The old personal fork URL, `https://github.com/jeremiahrthompson/hermes-agent`, redirects to the SumOfAgents org repo.
+
 ## Development Environment
 
 ```bash
