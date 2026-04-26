@@ -22,7 +22,7 @@ import concurrent.futures
 import json
 import logging
 import re
-from typing import Dict, Any, List, Optional, Union
+from typing import Dict, Any, List, Optional, Union, Callable
 
 from agent.auxiliary_client import async_call_llm, extract_content_or_reasoning
 MAX_SESSION_CHARS = 100_000
@@ -326,14 +326,18 @@ def session_search(
     query: str,
     role_filter: str = None,
     limit: int = 3,
+    mode: str = "fast",
     db=None,
     current_session_id: str = None,
+    semantic_search: Optional[Callable[[str, int], List[Dict[str, Any]]]] = None,
 ) -> str:
     """
-    Search past sessions and return focused summaries of matching conversations.
+    Search past sessions and return matching conversations.
 
-    Uses FTS5 to find matches, then summarizes the top sessions with the
-    configured auxiliary session_search model.
+    Default mode is "fast": FTS5 only, no LLM calls, returns session IDs,
+    metadata, and hit snippets immediately. Use mode="summary" when a deeper
+    LLM-generated recap using the configured auxiliary session_search model is
+    needed after the right session has been identified.
     The current session is excluded from results since the agent already has that context.
     """
     if db is None:
@@ -355,6 +359,11 @@ def session_search(
         return _list_recent_sessions(db, limit, current_session_id)
 
     query = query.strip()
+    mode = (mode or "fast").strip().lower()
+    if mode not in {"fast", "hybrid", "semantic", "summary", "summaries", "full"}:
+        mode = "fast"
+    summarize = mode in {"summary", "summaries", "full"}
+    hybrid = mode in {"hybrid", "semantic"}
 
     try:
         # Parse role filter
@@ -371,7 +380,7 @@ def session_search(
             offset=0,
         )
 
-        if not raw_results:
+        if not raw_results and not hybrid:
             return json.dumps({
                 "success": True,
                 "query": query,
@@ -430,6 +439,134 @@ def session_search(
                 seen_sessions[resolved_sid] = result
             if len(seen_sessions) >= limit:
                 break
+
+        if hybrid:
+            semantic_results = []
+            semantic_error = ""
+            if semantic_search is not None:
+                try:
+                    semantic_results = semantic_search(query, n_results=max(limit * 3, 5)) or []
+                except Exception as e:
+                    semantic_error = str(e)
+            elif mode == "semantic":
+                semantic_error = "Semantic search provider is not available."
+
+            candidates: Dict[str, Dict[str, Any]] = {}
+
+            def _session_meta(session_id: str) -> Dict[str, Any]:
+                if not session_id:
+                    return {}
+                try:
+                    return db.get_session(session_id) or {}
+                except Exception:
+                    return {}
+
+            for rank, (session_id, match_info) in enumerate(seen_sessions.items(), start=1):
+                meta = _session_meta(session_id)
+                candidates[session_id] = {
+                    "session_id": session_id,
+                    "when": _format_timestamp(match_info.get("session_started") or meta.get("started_at")),
+                    "source": match_info.get("source") or meta.get("source") or "unknown",
+                    "title": meta.get("title") or None,
+                    "model": match_info.get("model") or meta.get("model"),
+                    "score": max(0.0, 0.72 - (rank - 1) * 0.03),
+                    "match_reasons": ["fts"],
+                    "fts": {
+                        "rank": rank,
+                        "snippet": match_info.get("snippet") or "",
+                        "matched_role": match_info.get("role"),
+                        "matched_at": _format_timestamp(match_info.get("timestamp")),
+                        "context": match_info.get("context") or [],
+                    },
+                }
+
+            for rank, sem in enumerate(semantic_results, start=1):
+                metadata = sem.get("metadata") or {}
+                sid = metadata.get("session_id") or sem.get("session_id")
+                if not sid:
+                    sid = f"semantic_only_{rank}"
+                resolved_sid = _resolve_to_parent(sid) if sid and not sid.startswith("semantic_only_") else sid
+                if current_lineage_root and resolved_sid == current_lineage_root:
+                    continue
+                meta = _session_meta(resolved_sid) if not resolved_sid.startswith("semantic_only_") else {}
+                similarity = sem.get("similarity")
+                if similarity is None:
+                    similarity = sem.get("score", 0.0)
+                try:
+                    similarity_float = float(similarity or 0.0)
+                except (TypeError, ValueError):
+                    similarity_float = 0.0
+                sem_score = min(max(similarity_float, 0.0), 0.75)
+                content = sem.get("content") or ""
+                semantic_payload = {
+                    "rank": rank,
+                    "similarity": round(similarity_float, 4),
+                    "score": sem.get("score"),
+                    "content_preview": content[:500],
+                    "metadata": metadata,
+                }
+                if resolved_sid in candidates:
+                    candidates[resolved_sid]["semantic"] = semantic_payload
+                    if "semantic" not in candidates[resolved_sid]["match_reasons"]:
+                        candidates[resolved_sid]["match_reasons"].append("semantic")
+                    candidates[resolved_sid]["score"] = min(1.0, max(candidates[resolved_sid]["score"], sem_score) + 0.20)
+                else:
+                    candidates[resolved_sid] = {
+                        "session_id": None if resolved_sid.startswith("semantic_only_") else resolved_sid,
+                        "when": _format_timestamp(meta.get("started_at")),
+                        "source": meta.get("source") or "unknown",
+                        "title": meta.get("title") or None,
+                        "model": meta.get("model"),
+                        "score": sem_score,
+                        "match_reasons": ["semantic"],
+                        "semantic": semantic_payload,
+                    }
+
+            merged = list(candidates.values())
+            merged.sort(key=lambda item: item.get("score", 0.0), reverse=True)
+            merged = merged[:limit]
+            for item in merged:
+                item["score"] = round(item.get("score", 0.0), 4)
+            return json.dumps({
+                "success": True,
+                "mode": "hybrid" if mode == "hybrid" else "semantic",
+                "query": query,
+                "results": merged,
+                "count": len(merged),
+                "sessions_searched": len(seen_sessions),
+                "semantic_searched": len(semantic_results),
+                "degraded": bool(semantic_error),
+                **({"semantic_error": semantic_error} if semantic_error else {}),
+            }, ensure_ascii=False)
+
+        if not summarize:
+            fast_results = []
+            for session_id, match_info in seen_sessions.items():
+                try:
+                    session_meta = db.get_session(session_id) or {}
+                except Exception:
+                    session_meta = {}
+                context = match_info.get("context") or []
+                fast_results.append({
+                    "session_id": session_id,
+                    "when": _format_timestamp(match_info.get("session_started") or session_meta.get("started_at")),
+                    "source": match_info.get("source") or session_meta.get("source") or "unknown",
+                    "title": session_meta.get("title") or None,
+                    "model": match_info.get("model") or session_meta.get("model"),
+                    "matched_role": match_info.get("role"),
+                    "matched_at": _format_timestamp(match_info.get("timestamp")),
+                    "snippet": match_info.get("snippet") or "",
+                    "context": context,
+                })
+            return json.dumps({
+                "success": True,
+                "mode": "fast",
+                "query": query,
+                "results": fast_results,
+                "count": len(fast_results),
+                "sessions_searched": len(seen_sessions),
+                "message": "Fast FTS match list returned without LLM summarization. Re-run with mode='summary' for a deeper recap of selected sessions.",
+            }, ensure_ascii=False)
 
         # Prepare all sessions for parallel summarization
         tasks = []
@@ -544,13 +681,18 @@ SESSION_SEARCH_SCHEMA = {
     "name": "session_search",
     "description": (
         "Search your long-term memory of past conversations, or browse recent sessions. This is your recall -- "
-        "every past session is searchable, and this tool summarizes what happened.\n\n"
-        "TWO MODES:\n"
+        "every past session is searchable.\n\n"
+        "THREE MODES:\n"
         "1. Recent sessions (no query): Call with no arguments to see what was worked on recently. "
         "Returns titles, previews, and timestamps. Zero LLM cost, instant. "
         "Start here when the user asks what were we working on or what did we do recently.\n"
-        "2. Keyword search (with query): Search for specific topics across all past sessions. "
-        "Returns LLM-generated summaries of matching sessions.\n\n"
+        "2. Fast keyword search (default): Search specific topics across all past sessions with FTS5 only. "
+        "Returns session IDs, dates, titles, snippets, and local context without any LLM summarization. "
+        "Use this first when the user asks to find or resume a previous session.\n"
+        "3. Hybrid search (mode='hybrid'): Combines SQLite FTS exact matches with ChromaDB session-history semantic matches, "
+        "merges by session_id, and returns ranked evidence without LLM summarization. Use when exact terms are uncertain.\n"
+        "4. Summary search (mode='summary'): After fast or hybrid search identifies the right candidate, request "
+        "LLM-generated summaries of matching sessions. Slower but more detailed.\n\n"
         "USE THIS PROACTIVELY when:\n"
         "- The user says 'we did this before', 'remember when', 'last time', 'as I mentioned'\n"
         "- The user asks about a topic you worked on before but don't have in current context\n"
@@ -571,6 +713,12 @@ SESSION_SEARCH_SCHEMA = {
             "query": {
                 "type": "string",
                 "description": "Search query — keywords, phrases, or boolean expressions to find in past sessions. Omit this parameter entirely to browse recent sessions instead (returns titles, previews, timestamps with no LLM cost).",
+            },
+            "mode": {
+                "type": "string",
+                "enum": ["fast", "hybrid", "semantic", "summary"],
+                "description": "Search mode. Default 'fast' returns FTS snippets and session metadata with no LLM call. Use 'hybrid' when exact terms are uncertain; it combines FTS with semantic session-history vector search. Use 'summary' only after fast/hybrid search when you need deeper LLM-generated recaps.",
+                "default": "fast",
             },
             "role_filter": {
                 "type": "string",
@@ -598,8 +746,10 @@ registry.register(
         query=args.get("query") or "",
         role_filter=args.get("role_filter"),
         limit=args.get("limit", 3),
+        mode=args.get("mode", "fast"),
         db=kw.get("db"),
-        current_session_id=kw.get("current_session_id")),
+        current_session_id=kw.get("current_session_id"),
+        semantic_search=kw.get("semantic_search")),
     check_fn=check_session_search_requirements,
     emoji="🔍",
 )

@@ -234,7 +234,7 @@ class TestSessionSearchConcurrency:
             {"role": "assistant", "content": "response"},
         ]
 
-        result = json.loads(session_search(query="message", db=mock_db, limit=3))
+        result = json.loads(session_search(query="message", db=mock_db, limit=3, mode="summary"))
 
         assert result["success"] is True
         assert result["count"] == 3
@@ -326,6 +326,171 @@ class TestSessionSearch:
         mock_db = object()
         result = json.loads(session_search(query="   ", db=mock_db))
         assert result["success"] is False
+
+    def test_fast_mode_is_default_and_does_not_summarize(self, monkeypatch):
+        """Default keyword search should return FTS snippets without an LLM call."""
+        from unittest.mock import MagicMock
+        from tools.session_search_tool import session_search
+
+        async def fail_if_called(*_args, **_kwargs):
+            raise AssertionError("summarizer should not be called in default fast mode")
+
+        monkeypatch.setattr("tools.session_search_tool._summarize_session", fail_if_called)
+
+        mock_db = MagicMock()
+        mock_db.search_messages.return_value = [
+            {
+                "session_id": "s1",
+                "role": "user",
+                "snippet": ">>>paper<<< betting POC",
+                "context": [{"role": "user", "content": "paper betting POC"}],
+                "source": "cli",
+                "session_started": 1709500000,
+                "timestamp": 1709500010,
+                "model": "test",
+            }
+        ]
+        mock_db.get_session.return_value = {
+            "id": "s1",
+            "parent_session_id": None,
+            "source": "cli",
+            "title": "Paper betting proof POC",
+            "started_at": 1709500000,
+        }
+
+        result = json.loads(session_search(query="paper betting", db=mock_db, limit=3))
+
+        assert result["success"] is True
+        assert result["mode"] == "fast"
+        assert result["count"] == 1
+        assert result["results"][0]["session_id"] == "s1"
+        assert result["results"][0]["snippet"] == ">>>paper<<< betting POC"
+        mock_db.get_messages_as_conversation.assert_not_called()
+
+    def test_hybrid_mode_merges_fts_and_semantic_same_session(self):
+        """Hybrid mode should combine exact and semantic evidence for the same session."""
+        from unittest.mock import MagicMock
+        from tools.session_search_tool import session_search
+
+        mock_db = MagicMock()
+        mock_db.search_messages.return_value = [
+            {
+                "session_id": "s1",
+                "role": "user",
+                "snippet": ">>>previous<<< session quicker",
+                "context": [{"role": "user", "content": "find previous session quicker"}],
+                "source": "cli",
+                "session_started": 1709500000,
+                "timestamp": 1709500010,
+                "model": "test",
+            }
+        ]
+        mock_db.get_session.return_value = {
+            "id": "s1",
+            "parent_session_id": None,
+            "source": "cli",
+            "title": "Session recall speedup",
+            "started_at": 1709500000,
+        }
+
+        def semantic_search(_query, n_results=5):
+            return [
+                {
+                    "content": "User wanted faster previous-session recall after restart",
+                    "score": 0.66,
+                    "similarity": 0.61,
+                    "metadata": {"session_id": "s1", "target": "session_turn"},
+                }
+            ]
+
+        result = json.loads(session_search(
+            query="previous session quicker",
+            db=mock_db,
+            limit=3,
+            mode="hybrid",
+            semantic_search=semantic_search,
+        ))
+
+        assert result["success"] is True
+        assert result["mode"] == "hybrid"
+        assert result["degraded"] is False
+        assert result["count"] == 1
+        entry = result["results"][0]
+        assert entry["session_id"] == "s1"
+        assert entry["match_reasons"] == ["fts", "semantic"]
+        assert entry["fts"]["snippet"] == ">>>previous<<< session quicker"
+        assert entry["semantic"]["content_preview"].startswith("User wanted faster")
+
+    def test_hybrid_mode_includes_semantic_only_session_with_metadata(self):
+        """Hybrid mode should include semantic-only hits and hydrate SQLite metadata."""
+        from unittest.mock import MagicMock
+        from tools.session_search_tool import session_search
+
+        mock_db = MagicMock()
+        mock_db.search_messages.return_value = []
+        mock_db.get_session.return_value = {
+            "id": "s2",
+            "parent_session_id": None,
+            "source": "telegram",
+            "title": "Conceptual recall session",
+            "started_at": 1709400000,
+            "model": "test-model",
+        }
+
+        def semantic_search(_query, n_results=5):
+            return [
+                {
+                    "content": "A semantically related session turn",
+                    "score": 0.72,
+                    "similarity": 0.64,
+                    "metadata": {"session_id": "s2", "target": "session_turn"},
+                }
+            ]
+
+        result = json.loads(session_search(
+            query="concept only",
+            db=mock_db,
+            limit=3,
+            mode="hybrid",
+            semantic_search=semantic_search,
+        ))
+
+        assert result["success"] is True
+        assert result["count"] == 1
+        entry = result["results"][0]
+        assert entry["session_id"] == "s2"
+        assert entry["match_reasons"] == ["semantic"]
+        assert entry["title"] == "Conceptual recall session"
+        assert entry["source"] == "telegram"
+
+    def test_hybrid_mode_degrades_when_semantic_search_fails(self):
+        """Hybrid mode should still return FTS results when semantic lane fails."""
+        from unittest.mock import MagicMock
+        from tools.session_search_tool import session_search
+
+        mock_db = MagicMock()
+        mock_db.search_messages.return_value = [
+            {"session_id": "s1", "role": "user", "snippet": "exact hit", "context": [],
+             "source": "cli", "session_started": 1709500000, "timestamp": 1709500001, "model": "test"}
+        ]
+        mock_db.get_session.return_value = {"id": "s1", "parent_session_id": None, "source": "cli", "started_at": 1709500000}
+
+        def semantic_search(_query, n_results=5):
+            raise RuntimeError("embedding service unavailable")
+
+        result = json.loads(session_search(
+            query="exact hit",
+            db=mock_db,
+            limit=3,
+            mode="hybrid",
+            semantic_search=semantic_search,
+        ))
+
+        assert result["success"] is True
+        assert result["mode"] == "hybrid"
+        assert result["degraded"] is True
+        assert "embedding service unavailable" in result["semantic_error"]
+        assert result["results"][0]["match_reasons"] == ["fts"]
 
     def test_current_session_excluded(self):
         """session_search should never return the current session."""
