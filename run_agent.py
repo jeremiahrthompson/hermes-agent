@@ -8227,6 +8227,26 @@ class AIAgent:
             parent_agent=self,
         )
 
+    def _session_semantic_search(self, query: str, n_results: int = 5) -> list:
+        """Return ChromaDB session-history semantic hits for session_search hybrid mode."""
+        if not self._memory_manager or not self._memory_manager.has_tool("vector_search"):
+            return []
+        raw = self._memory_manager.handle_tool_call("vector_search", {
+            "query": query,
+            "collection": "sessions",
+            "n_results": n_results,
+        })
+        try:
+            data = json.loads(raw) if isinstance(raw, str) else raw
+        except Exception as exc:
+            raise RuntimeError(f"Invalid vector_search response: {exc}") from exc
+        if not isinstance(data, dict):
+            return []
+        if data.get("error"):
+            raise RuntimeError(str(data.get("error")))
+        results = data.get("results") or []
+        return results if isinstance(results, list) else []
+
     def _invoke_tool(self, function_name: str, function_args: dict, effective_task_id: str,
                      tool_call_id: Optional[str] = None, messages: list = None) -> str:
         """Invoke a single tool and return the result string. No display logic.
@@ -8262,8 +8282,10 @@ class AIAgent:
                 query=function_args.get("query", ""),
                 role_filter=function_args.get("role_filter"),
                 limit=function_args.get("limit", 3),
+                mode=function_args.get("mode", "fast"),
                 db=self._session_db,
                 current_session_id=self.session_id,
+                semantic_search=self._session_semantic_search,
             )
         elif function_name == "memory":
             target = function_args.get("target", "memory")
@@ -8774,8 +8796,10 @@ class AIAgent:
                         query=function_args.get("query", ""),
                         role_filter=function_args.get("role_filter"),
                         limit=function_args.get("limit", 3),
+                        mode=function_args.get("mode", "fast"),
                         db=self._session_db,
                         current_session_id=self.session_id,
+                        semantic_search=self._session_semantic_search,
                     )
                 tool_duration = time.time() - tool_start_time
                 if self._should_emit_quiet_tool_messages():
