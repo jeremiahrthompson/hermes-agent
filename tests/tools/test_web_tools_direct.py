@@ -1,5 +1,6 @@
 import asyncio
 import json
+import httpx
 from unittest.mock import AsyncMock, MagicMock, patch
 
 
@@ -87,6 +88,27 @@ def test_web_search_tool_direct_dispatch():
     assert result["data"]["web"][0]["url"] == "https://e.com"
 
 
+def test_web_search_tool_falls_back_to_direct_when_tavily_http_fails():
+    request = httpx.Request("POST", "https://api.tavily.com/search")
+    response = httpx.Response(432, request=request, text="quota or account error")
+    tavily_error = httpx.HTTPStatusError("Tavily failed", request=request, response=response)
+
+    with patch("tools.web_tools._get_backend", return_value="tavily"), \
+         patch("tools.web_tools._tavily_request", side_effect=tavily_error), \
+         patch("tools.web_tools._direct_search", return_value={
+             "success": True,
+             "data": {"web": [{"title": "Fallback", "url": "https://e.com", "description": "D", "position": 1}]},
+         }) as direct_search, \
+         patch("tools.interrupt.is_interrupted", return_value=False):
+        from tools.web_tools import web_search_tool
+
+        result = json.loads(web_search_tool("test query", limit=3))
+
+    assert result["success"] is True
+    assert result["data"]["web"][0]["title"] == "Fallback"
+    direct_search.assert_called_once_with("test query", 3)
+
+
 def test_web_extract_tool_direct_dispatch():
     with patch("tools.web_tools._get_backend", return_value="direct"), \
          patch("tools.web_tools._direct_extract", new=AsyncMock(return_value=[{
@@ -108,6 +130,63 @@ def test_web_extract_tool_direct_dispatch():
         "content": "Body text",
         "error": None,
     }]
+
+
+def test_web_extract_tool_falls_back_to_direct_when_tavily_http_fails():
+    request = httpx.Request("POST", "https://api.tavily.com/extract")
+    response = httpx.Response(432, request=request, text="quota or account error")
+    tavily_error = httpx.HTTPStatusError("Tavily failed", request=request, response=response)
+
+    with patch("tools.web_tools._get_backend", return_value="tavily"), \
+         patch("tools.web_tools._tavily_request", side_effect=tavily_error), \
+         patch("tools.web_tools._direct_extract", new=AsyncMock(return_value=[{
+             "url": "https://example.com",
+             "title": "Fallback",
+             "content": "Fallback body",
+             "raw_content": "Fallback body",
+         }])) as direct_extract, \
+         patch("tools.web_tools.process_content_with_llm", return_value=None):
+        from tools.web_tools import web_extract_tool
+
+        result = json.loads(asyncio.get_event_loop().run_until_complete(
+            web_extract_tool(["https://example.com"], use_llm_processing=False)
+        ))
+
+    assert result["results"][0]["title"] == "Fallback"
+    direct_extract.assert_awaited_once()
+
+
+def test_direct_extract_uses_reader_specific_headers():
+    captured_headers = None
+
+    class FakeResponse:
+        text = "Title: Example\n\nMarkdown Content:\nBody"
+
+        def raise_for_status(self):
+            return None
+
+    class FakeAsyncClient:
+        def __init__(self, headers=None, timeout=None, follow_redirects=None):
+            nonlocal captured_headers
+            captured_headers = headers
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def get(self, url):
+            return FakeResponse()
+
+    with patch("tools.web_tools.httpx.AsyncClient", FakeAsyncClient):
+        from tools.web_tools import _direct_extract
+
+        result = asyncio.get_event_loop().run_until_complete(_direct_extract(["https://example.com"]))
+
+    assert result[0]["content"] == "Body"
+    assert captured_headers is not None
+    assert "Chrome/" not in captured_headers.get("User-Agent", "")
 
 
 def test_web_crawl_tool_direct_dispatch():
