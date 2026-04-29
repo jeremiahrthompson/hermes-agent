@@ -419,6 +419,12 @@ _DIRECT_WEB_HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 
+_DIRECT_READER_HEADERS = {
+    "User-Agent": "HermesAgent/1.0 (+https://github.com/NousResearch/hermes-agent)",
+    "Accept": "text/plain, text/markdown, */*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
 
 def _strip_html_fragment(value: str) -> str:
     """Convert small HTML fragments into plain text."""
@@ -508,7 +514,7 @@ async def _direct_extract(urls: List[str], format: Optional[str] = None) -> List
     """Keyless extraction fallback using the jina reader mirror."""
     del format  # direct mode always returns markdown-ish text
 
-    async with httpx.AsyncClient(headers=_DIRECT_WEB_HEADERS, timeout=45, follow_redirects=True) as client:
+    async with httpx.AsyncClient(headers=_DIRECT_READER_HEADERS, timeout=45, follow_redirects=True) as client:
         async def fetch_one(url: str) -> Dict[str, Any]:
             try:
                 response = await client.get(_direct_reader_url(url))
@@ -1319,13 +1325,17 @@ def web_search_tool(query: str, limit: int = 5) -> str:
 
         if backend == "tavily":
             logger.info("Tavily search: '%s' (limit: %d)", query, limit)
-            raw = _tavily_request("search", {
-                "query": query,
-                "max_results": min(limit, 20),
-                "include_raw_content": False,
-                "include_images": False,
-            })
-            response_data = _normalize_tavily_search_results(raw)
+            try:
+                raw = _tavily_request("search", {
+                    "query": query,
+                    "max_results": min(limit, 20),
+                    "include_raw_content": False,
+                    "include_images": False,
+                })
+                response_data = _normalize_tavily_search_results(raw)
+            except (httpx.HTTPError, ValueError) as exc:
+                logger.warning("Tavily search failed; falling back to direct search: %s", exc)
+                response_data = _direct_search(query, limit)
             debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
             result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
             debug_call_data["final_response_size"] = len(result_json)
@@ -1472,11 +1482,15 @@ async def web_extract_tool(
                 results = _exa_extract(safe_urls)
             elif backend == "tavily":
                 logger.info("Tavily extract: %d URL(s)", len(safe_urls))
-                raw = _tavily_request("extract", {
-                    "urls": safe_urls,
-                    "include_images": False,
-                })
-                results = _normalize_tavily_documents(raw, fallback_url=safe_urls[0] if safe_urls else "")
+                try:
+                    raw = _tavily_request("extract", {
+                        "urls": safe_urls,
+                        "include_images": False,
+                    })
+                    results = _normalize_tavily_documents(raw, fallback_url=safe_urls[0] if safe_urls else "")
+                except (httpx.HTTPError, ValueError) as exc:
+                    logger.warning("Tavily extract failed; falling back to direct extract: %s", exc)
+                    results = await _direct_extract(safe_urls, format=format)
             elif backend == "direct":
                 logger.info("Direct extract fallback: %d URL(s)", len(safe_urls))
                 results = await _direct_extract(safe_urls, format=format)
@@ -1801,8 +1815,12 @@ async def web_crawl_tool(
             }
             if instructions:
                 payload["instructions"] = instructions
-            raw = _tavily_request("crawl", payload)
-            results = _normalize_tavily_documents(raw, fallback_url=url)
+            try:
+                raw = _tavily_request("crawl", payload)
+                results = _normalize_tavily_documents(raw, fallback_url=url)
+            except (httpx.HTTPError, ValueError) as exc:
+                logger.warning("Tavily crawl failed; falling back to direct crawl: %s", exc)
+                results = await _direct_crawl(url, instructions, depth)
 
             response = {"results": results}
             # Fall through to the shared LLM processing and trimming below

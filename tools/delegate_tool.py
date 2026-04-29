@@ -729,6 +729,7 @@ def _run_backup_subagent(
             override_api_mode=backup_runtime.get("api_mode"),
             override_acp_command=backup_runtime.get("command"),
             override_acp_args=backup_runtime.get("args"),
+            task_count=1,
         )
         child._delegate_saved_tool_names = parent_tool_names
     finally:
