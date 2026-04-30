@@ -2591,6 +2591,24 @@ class AIAgent:
             return cfg
         return float(os.getenv("HERMES_API_TIMEOUT", 1800.0))
 
+    def _should_short_circuit_api_timeout_retry(self, api_error: Exception, classified: Any) -> bool:
+        """Return True when retrying the same provider would only burn another full timeout.
+
+        Codex/chatgpt.com I27-class math calls can legitimately run near the
+        configured stale timeout.  If the orchestrator aborts one, immediately
+        fail (or let the caller switch to fallback) instead of spending three
+        complete timeout windows on identical retries.
+        """
+        if self.api_mode != "codex_responses" or self.provider != "openai-codex":
+            return False
+        if getattr(classified, "reason", None) == FailoverReason.timeout:
+            return True
+        error_type = type(api_error).__name__
+        if error_type in {"TimeoutError", "ReadTimeout", "ConnectTimeout", "PoolTimeout", "APITimeoutError"}:
+            return True
+        error_text = str(api_error).lower()
+        return "timed out" in error_text or "timeout" in error_text
+
     def _resolved_api_call_stale_timeout_base(self) -> tuple[float, bool]:
         """Resolve the base non-stream stale timeout and whether it is implicit.
 
@@ -10792,6 +10810,37 @@ class AIAgent:
                         classified.retryable, classified.should_compress,
                         classified.should_rotate_credential, classified.should_fallback,
                     )
+
+                    if self._should_short_circuit_api_timeout_retry(api_error, classified):
+                        _timeout_summary = self._summarize_api_error(api_error)
+                        self._emit_status(
+                            f"⏱️ Codex request timed out after {elapsed_time:.0f}s; "
+                            "not retrying identical timeout window."
+                        )
+                        logger.warning(
+                            "%sCodex timeout short-circuited after one attempt. %s summary=%s",
+                            self.log_prefix,
+                            self._client_log_context(),
+                            _timeout_summary,
+                        )
+                        if self._try_activate_fallback(reason=classified.reason):
+                            retry_count = 0
+                            compression_attempts = 0
+                            primary_recovery_attempted = False
+                            continue
+                        self._persist_session(messages, conversation_history)
+                        return {
+                            "final_response": (
+                                "Codex request timed out after "
+                                f"{elapsed_time:.0f}s and was not retried to avoid "
+                                "burning multiple full timeout windows."
+                            ),
+                            "messages": messages,
+                            "api_calls": api_call_count,
+                            "completed": False,
+                            "failed": True,
+                            "error": _timeout_summary,
+                        }
 
                     recovered_with_pool, has_retried_429 = self._recover_with_credential_pool(
                         status_code=status_code,
