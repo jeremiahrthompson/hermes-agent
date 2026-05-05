@@ -466,7 +466,7 @@ def session_search(
                 candidates[session_id] = {
                     "session_id": session_id,
                     "when": _format_timestamp(match_info.get("session_started") or meta.get("started_at")),
-                    "source": match_info.get("source") or meta.get("source") or "unknown",
+                    "source": meta.get("source") or match_info.get("source") or "unknown",
                     "title": meta.get("title") or None,
                     "model": match_info.get("model") or meta.get("model"),
                     "score": max(0.0, 0.72 - (rank - 1) * 0.03),
@@ -550,7 +550,7 @@ def session_search(
                 fast_results.append({
                     "session_id": session_id,
                     "when": _format_timestamp(match_info.get("session_started") or session_meta.get("started_at")),
-                    "source": match_info.get("source") or session_meta.get("source") or "unknown",
+                    "source": session_meta.get("source") or match_info.get("source") or "unknown",
                     "title": session_meta.get("title") or None,
                     "model": match_info.get("model") or session_meta.get("model"),
                     "matched_role": match_info.get("role"),
