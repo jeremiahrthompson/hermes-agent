@@ -364,7 +364,7 @@ def _get_child_timeout() -> float:
     """Read delegation.child_timeout_seconds from config.
 
     Returns the number of seconds a single child agent is allowed to run
-    before being considered stuck.  Default: 600 s (10 minutes).
+    before being considered stuck.  Default: 1200 s (20 minutes).
     """
     cfg = _load_config()
     val = cfg.get("child_timeout_seconds")
@@ -475,7 +475,7 @@ def _preserve_parent_mcp_toolsets(
 
 
 DEFAULT_MAX_ITERATIONS = 50
-DEFAULT_CHILD_TIMEOUT = 600  # seconds before a child agent is considered stuck
+DEFAULT_CHILD_TIMEOUT = 1200  # seconds before a child agent is considered stuck
 _HEARTBEAT_INTERVAL = 30  # seconds between parent activity heartbeats during delegation
 # Stale-heartbeat thresholds. A child with no API-call progress is either:
 #   - idle between turns (no current_tool) — probably stuck on a slow API call
@@ -483,9 +483,9 @@ _HEARTBEAT_INTERVAL = 30  # seconds between parent activity heartbeats during de
 #     operation (terminal command, web fetch, large file read)
 # The idle ceiling stays tight so genuinely stuck children don't mask the gateway
 # timeout. The in-tool ceiling is much higher so legit long-running tools get
-# time to finish; child_timeout_seconds (default 600s) is still the hard cap.
+# time to finish; child_timeout_seconds (default 1200s) is still the hard cap.
 _HEARTBEAT_STALE_CYCLES_IDLE = 5  # 5 * 30s = 150s idle between turns → stale
-_HEARTBEAT_STALE_CYCLES_IN_TOOL = 20  # 20 * 30s = 600s stuck on same tool → stale
+_HEARTBEAT_STALE_CYCLES_IN_TOOL = 40  # 40 * 30s = 1200s stuck on same tool → stale
 DEFAULT_TOOLSETS = ["terminal", "file", "web"]
 
 
@@ -763,7 +763,7 @@ def _run_claude_code_task(
             prompt=goal,
             cwd=workspace,
             max_turns=0,
-            model=primary_model or "claude-opus-4-6",
+            model=primary_model or "claude-opus-4-7",
             system_prompt=system_prompt,
         )
         summary = getattr(response.choices[0].message, "content", "") or ""
@@ -2139,7 +2139,7 @@ def delegate_task(
                 task_index=0,
                 task=_t,
                 parent_agent=parent_agent,
-                primary_model=str(coding_cfg.get("primary_model") or "claude-opus-4-6"),
+                primary_model=str(coding_cfg.get("primary_model") or "claude-opus-4-7"),
                 backup_runtime=backup_runtime,
                 max_iterations=effective_max_iter,
                 saved_parent_tool_names=_parent_tool_names,
@@ -2162,7 +2162,7 @@ def delegate_task(
                         task_index=i,
                         task=t,
                         parent_agent=parent_agent,
-                        primary_model=str(coding_cfg.get("primary_model") or "claude-opus-4-6"),
+                        primary_model=str(coding_cfg.get("primary_model") or "claude-opus-4-7"),
                         backup_runtime=backup_runtime,
                         max_iterations=effective_max_iter,
                         saved_parent_tool_names=_parent_tool_names,
@@ -2629,7 +2629,7 @@ DELEGATE_TASK_SCHEMA = {
                 "items": {"type": "string"},
                 "description": (
                     "Arguments for the ACP command (default: ['--acp', '--stdio']). "
-                    "Only used when acp_command is set. Example: ['--acp', '--stdio', '--model', 'claude-opus-4-6']"
+                    "Only used when acp_command is set. Example: ['--acp', '--stdio', '--model', 'claude-opus-4-7']"
                 ),
             },
         },

@@ -173,7 +173,7 @@ def dispatch_claude_agent(
     prompt: str,
     cwd: Optional[str] = None,
     max_turns: int = 0,
-    model: str = "claude-opus-4-6",
+    model: str = "claude-opus-4-7",
     system_prompt: Optional[str] = None,
 ) -> SimpleNamespace:
     """Dispatch Claude Code as an autonomous agent with full tool access.
@@ -189,7 +189,7 @@ def dispatch_claude_agent(
         cwd: Working directory for the agent (where it reads/writes files).
             Defaults to current working directory.
         max_turns: Maximum agentic turns. 0 = unlimited (default).
-        model: Model to use (default claude-opus-4-6).
+        model: Model to use (default claude-opus-4-7).
         system_prompt: Optional system prompt override.
 
     Returns:
@@ -221,12 +221,12 @@ def dispatch_claude_agent(
             cmd,
             capture_output=True,
             text=True,
-            timeout=900,
+            timeout=1200,
             env=env,
             cwd=effective_cwd,
         )
     except subprocess.TimeoutExpired:
-        raise RuntimeError("Claude CLI agent timed out after 15 minutes")
+        raise RuntimeError("Claude CLI agent timed out after 20 minutes")
     except FileNotFoundError:
         raise RuntimeError(
             "Claude CLI not found. Ensure 'claude' is installed and in PATH, "
