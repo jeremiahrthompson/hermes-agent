@@ -29,6 +29,16 @@ If `$HERMES_TENANT` is set, the task belongs to a tenant namespace. When reading
 - Good: `business-a: Acme is our biggest customer`
 - Bad (leaks): `Acme is our biggest customer`
 
+## Authority vs. obligation
+
+Your kanban card tells you **what to do, in what order, owned by you**. It does not, by itself, certify what is true. When a downstream worker reads your `summary`/`metadata` it sees your *claim*; whether that claim is authoritative depends on whether you wrote the underlying artifact (code, tests, dataset, citation, signed receipt, review approval).
+
+Two rules follow:
+1. **Write evidence into artifacts, not prose.** A research finding lives in the dataset/notebook plus commit; a code change lives in the diff plus tests; a security claim lives in the review record plus reproducer. Your kanban summary should *point at* the artifact (path, SHA, test id, receipt URI), not replace it.
+2. **Do not promote a parent's prose to proof.** When `kanban_show()` returns a parent handoff, treat the prose as a pointer. If the stakes warrant it (regulated, safety-critical, financial, security, or research), open the artifacts and verify before building on the claim.
+
+If you cannot produce a verifiable artifact for the work the task is asking for, `kanban_block` with a reason rather than completing with confident prose.
+
 ## Good summary + metadata shapes
 
 The `kanban_complete(summary=..., metadata=...)` handoff is how downstream workers read what you did. Patterns that work:
@@ -54,6 +64,8 @@ kanban_complete(
         "sources_read": 12,
         "recommendation": "vLLM",
         "benchmarks": {"vllm": 1.0, "sglang": 0.87, "trtllm": 0.72},
+        "findings_artifact": "research/inference-libraries-2026-05.md",
+        "artifact_commit": "abc1234...",
     },
 )
 ```
@@ -139,6 +151,8 @@ If you open the task and `kanban_show` returns `runs: [...]` with one or more cl
 - Modify files outside `$HERMES_KANBAN_WORKSPACE` unless the task body says to.
 - Create follow-up tasks assigned to yourself — assign to the right specialist.
 - Complete a task you didn't actually finish. Block it instead.
+- Treat parent task `summary`/`metadata` as authoritative for research, safety, regulated, financial, or security claims. Verify against the source artifacts those handoffs reference.
+- Record a research finding only in `kanban_complete(summary=...)`. Write it to the source artifact (commit, dataset, notebook, citation, signed receipt) and have the summary reference it.
 
 ## Pitfalls
 

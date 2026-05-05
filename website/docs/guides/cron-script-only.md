@@ -10,18 +10,14 @@ Sometimes you already know exactly what message you want to send. You don't need
 
 Hermes calls this **no-agent mode**. It's the cron system minus the LLM.
 
-```
-   ┌──────────────────┐          ┌──────────────────┐
-   │ scheduler tick   │  every   │ run script       │
-   │ (every N minutes)│ ──────▶ │ (bash or python) │
-   └──────────────────┘          └──────────────────┘
-                                          │
-                                          │ stdout
-                                          ▼
-                                 ┌──────────────────┐
-                                 │ delivery router  │
-                                 │ (telegram/disc…) │
-                                 └──────────────────┘
+```mermaid
+flowchart LR
+    A[Scheduler tick<br/>every N minutes]
+    B[Run script<br/>bash or python]
+    C[Delivery router<br/>Telegram / Discord / Slack]
+
+    A -->|every tick| B
+    B -->|stdout when alerting| C
 ```
 
 - **No LLM call.** Zero tokens, zero agent loop, zero model spend.
