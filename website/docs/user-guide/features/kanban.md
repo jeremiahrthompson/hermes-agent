@@ -69,6 +69,12 @@ They coexist: a kanban worker may call `delegate_task` internally during its run
 - **Dispatcher** — a long-lived loop that, every N seconds (default 60): reclaims stale claims, reclaims crashed workers (PID gone but TTL not yet expired), promotes ready tasks, atomically claims, spawns assigned profiles. Runs **inside the gateway** by default (`kanban.dispatch_in_gateway: true`). One dispatcher sweeps all boards per tick; workers are spawned with `HERMES_KANBAN_BOARD` pinned so they can't see other boards. After ~5 consecutive spawn failures on the same task the dispatcher auto-blocks it with the last error as the reason — prevents thrashing on tasks whose profile doesn't exist, workspace can't mount, etc.
 - **Tenant** — optional string namespace *within* a board. One specialist fleet can serve multiple businesses (`--tenant business-a`) with data isolation by workspace path and memory key prefix. Tenants are a soft filter; boards are the hard isolation boundary.
 
+### What `done` means (and what it does not)
+
+A task in `done` means a worker handed off: it ran, did not block, and wrote a `summary` plus optional `metadata`/`result`. It does **not** mean the work is verified, reproducible, or correct. Kanban is the **execution-order/coordination** primitive: what runs next, who owns it, and what predecessors handed across. It is not the **evidence/claim authority** for what the work produced.
+
+For regulated, safety-critical, financial, security, or research work, treat the **source artifacts** (commits, tests, datasets, citations, signed receipts, review records) as the authority. Handoffs should point at those artifacts (`metadata={"commit": "...", "report_path": "...", "review_id": "..."}`) and downstream consumers should verify against them, not against upstream prose.
+
 ## Boards (multi-project)
 
 Boards let you separate unrelated streams of work — one per project, repo,
@@ -464,24 +470,15 @@ Visually the target is the familiar Linear / Fusion layout: dark theme, column h
 
 The GUI is strictly a **read-through-the-DB + write-through-kanban_db** layer with no domain logic of its own:
 
-```
-┌────────────────────────┐      WebSocket (tails task_events)
-│   React SPA (plugin)   │ ◀──────────────────────────────────┐
-│   HTML5 drag-and-drop  │                                    │
-└──────────┬─────────────┘                                    │
-           │ REST over fetchJSON                              │
-           ▼                                                  │
-┌────────────────────────┐     writes call kanban_db.*        │
-│  FastAPI router        │     directly — same code path      │
-│  plugins/kanban/       │     the CLI /kanban verbs use      │
-│  dashboard/plugin_api.py                                    │
-└──────────┬─────────────┘                                    │
-           │                                                  │
-           ▼                                                  │
-┌────────────────────────┐                                    │
-│  ~/.hermes/kanban.db   │ ───── append task_events ──────────┘
-│  (WAL, shared)         │
-└────────────────────────┘
+```mermaid
+flowchart TD
+    A[React SPA plugin<br/>HTML5 drag-and-drop]
+    B[FastAPI router<br/>plugins/kanban/dashboard/plugin_api.py]
+    C[(~/.hermes/kanban.db<br/>WAL shared)]
+
+    A -->|REST over fetchJSON| B
+    B -->|writes call kanban_db directly| C
+    C -->|WebSocket tails task_events| A
 ```
 
 ### REST surface

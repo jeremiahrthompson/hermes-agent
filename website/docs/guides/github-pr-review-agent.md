@@ -12,16 +12,14 @@ description: "Build an automated AI code reviewer that monitors your repos, revi
 
 **What you'll build:**
 
-```
-┌───────────────────────────────────────────────────────────────────┐
-│                                                                   │
-│   Cron Timer  ──▶  Hermes Agent  ──▶  GitHub API  ──▶  Review     │
-│   (every 2h)       + gh CLI           (PR diffs)       delivery   │
-│                    + skill                             (Telegram, │
-│                    + memory                            Discord,   │
-│                                                        local)     │
-│                                                                   │
-└───────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart LR
+    T[Cron Timer<br/>every 2h]
+    H[Hermes Agent<br/>gh CLI + skill + memory]
+    G[GitHub API<br/>PR diffs]
+    R[Review delivery<br/>Telegram / Discord / local]
+
+    T --> H --> G --> R
 ```
 
 This guide uses **cron jobs** to poll for PRs on a schedule — no server or public endpoint needed. Works behind NAT and firewalls.

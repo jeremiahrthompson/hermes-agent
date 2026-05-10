@@ -998,7 +998,7 @@ display:
 #
 # model_aliases:
 #   opus:
-#     model: claude-opus-4-6
+#     model: claude-opus-4-7
 #     provider: anthropic
 #   qwen:
 #     model: "qwen3.5:397b"

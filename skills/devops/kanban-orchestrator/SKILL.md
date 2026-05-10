@@ -33,6 +33,7 @@ Your job description says "route, don't execute." The rules that enforce that:
 - **For any concrete task, create a Kanban task and assign it.** Every single time.
 - **If no specialist fits, ask the user which profile to create.** Do not default to doing it yourself under "close enough."
 - **Decompose, route, and summarize — that's the whole job.**
+- **Do not declare high-stakes work complete from board prose alone.** For research, regulated, safety-critical, financial, or security tasks, require summaries to point at source artifacts (commit, dataset, citation, review record, receipt) and create/route a verifier task when artifact-level checking is needed.
 
 ## The standard specialist roster (convention)
 
@@ -150,6 +151,10 @@ Tell them what you created in plain prose:
 **Don't pre-create the whole graph if the shape depends on intermediate findings.** If T3's structure depends on what T1 and T2 find, let T3 exist as a "synthesize findings" task whose own first step is to read parent handoffs and plan the rest. Orchestrators can spawn orchestrators.
 
 **Tenant inheritance.** If `HERMES_TENANT` is set in your env, pass `tenant=os.environ.get("HERMES_TENANT")` on every `kanban_create` call so child tasks stay in the same namespace.
+
+## Authority boundary
+
+Kanban gives you authority over **routing and order** — who runs what, when, depending on what. It does not give you, or your workers, authority over **what is true**. For high-stakes domains, route a `reviewer` task whose definition of `done` is "verified against the artifact" rather than "read the predecessor's summary." A pipeline that ends with a writer summarizing an analyst's prose summary of a researcher's prose summary is not evidence; pin the chain to artifacts at every hop.
 
 ## Recovering stuck workers
 

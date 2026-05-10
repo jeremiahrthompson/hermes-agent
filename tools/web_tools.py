@@ -45,7 +45,9 @@ import logging
 import os
 import re
 import asyncio
+from html import unescape
 from typing import List, Dict, Any, Optional, TYPE_CHECKING
+from urllib.parse import parse_qs, quote, urlparse
 import httpx
 # NOTE: `from firecrawl import Firecrawl` is deliberately NOT at module top —
 # the SDK pulls ~200 ms of imports (httpcore, firecrawl.v1/v2 type trees) and
@@ -124,10 +126,16 @@ def _get_backend() -> str:
     Reads ``web.backend`` from config.yaml (set by ``hermes tools``).
     Falls back to whichever API key is present for users who configured
     keys manually without running setup.
+
+    If no API-backed provider is currently usable, Hermes falls back to a
+    keyless direct mode:
+    - search via DuckDuckGo HTML results
+    - extract via r.jina.ai reader
     """
     configured = (_load_web_config().get("backend") or "").lower().strip()
     if configured in ("parallel", "firecrawl", "tavily", "exa", "searxng"):
-        return configured
+        # SearXNG and other configured backends fall back to direct when unavailable
+        return configured if _is_backend_available(configured) else "direct"
 
     # Fallback for manual / legacy config — pick the highest-priority
     # available backend. Firecrawl also counts as available when the managed
@@ -143,7 +151,7 @@ def _get_backend() -> str:
         if available:
             return backend
 
-    return "firecrawl"  # default (backward compat)
+    return "direct"
 
 
 def _get_search_backend() -> str:
@@ -196,6 +204,8 @@ def _is_backend_available(backend: str) -> bool:
         return _has_env("TAVILY_API_KEY")
     if backend == "searxng":
         return _has_env("SEARXNG_URL")
+    if backend == "direct":
+        return True
     return False
 
 # ─── Firecrawl Client ────────────────────────────────────────────────────────
@@ -440,6 +450,173 @@ def _normalize_tavily_documents(response: dict, fallback_url: str = "") -> List[
             "metadata": {"sourceURL": url_str},
         })
     return documents
+
+
+_DIRECT_WEB_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/135.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+_DIRECT_READER_HEADERS = {
+    "User-Agent": "HermesAgent/1.0 (+https://github.com/NousResearch/hermes-agent)",
+    "Accept": "text/plain, text/markdown, */*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+
+def _strip_html_fragment(value: str) -> str:
+    """Convert small HTML fragments into plain text."""
+    if not value:
+        return ""
+    text = re.sub(r"<[^>]+>", " ", value)
+    text = unescape(text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _unwrap_duckduckgo_result_url(url: str) -> str:
+    """Resolve DuckDuckGo redirect links to their destination when possible."""
+    if not url:
+        return ""
+    if url.startswith("//"):
+        url = f"https:{url}"
+    parsed = urlparse(url)
+    if parsed.netloc.endswith("duckduckgo.com") and parsed.path.startswith("/l/"):
+        target = parse_qs(parsed.query).get("uddg", [""])[0]
+        if target:
+            return unescape(target)
+    return unescape(url)
+
+
+def _direct_search(query: str, limit: int) -> dict:
+    """Keyless search fallback using DuckDuckGo HTML results."""
+    search_url = f"https://html.duckduckgo.com/html/?q={quote(query)}"
+    response = httpx.get(search_url, headers=_DIRECT_WEB_HEADERS, timeout=30, follow_redirects=True)
+    response.raise_for_status()
+    html_body = response.text
+
+    pattern = re.compile(
+        r'<a[^>]+class="result__a"[^>]+href="(?P<href>[^"]+)"[^>]*>(?P<title>.*?)</a>(?P<tail>.*?)'
+        r'(?=<a[^>]+class="result__a"|</body>|$)',
+        re.IGNORECASE | re.DOTALL,
+    )
+    snippet_pattern = re.compile(
+        r'<a[^>]+class="result__snippet"[^>]*>(?P<snippet>.*?)</a>|'
+        r'<div[^>]+class="result__snippet"[^>]*>(?P<snippet_div>.*?)</div>',
+        re.IGNORECASE | re.DOTALL,
+    )
+
+    web_results: List[Dict[str, Any]] = []
+    for match in pattern.finditer(html_body):
+        href = _unwrap_duckduckgo_result_url(match.group("href"))
+        title = _strip_html_fragment(match.group("title"))
+        tail = match.group("tail") or ""
+        snippet_match = snippet_pattern.search(tail)
+        snippet = ""
+        if snippet_match:
+            snippet = _strip_html_fragment(snippet_match.group("snippet") or snippet_match.group("snippet_div") or "")
+        if href and title:
+            web_results.append({
+                "title": title,
+                "url": href,
+                "description": snippet,
+                "position": len(web_results) + 1,
+            })
+        if len(web_results) >= max(1, min(limit, 10)):
+            break
+
+    return {"success": True, "data": {"web": web_results}}
+
+
+def _direct_reader_url(url: str) -> str:
+    normalized = url.strip()
+    if normalized.startswith("http://"):
+        normalized = normalized[len("http://"):]
+    elif normalized.startswith("https://"):
+        normalized = normalized[len("https://"):]
+    return f"https://r.jina.ai/http://{normalized}"
+
+
+def _extract_reader_markdown(payload: str) -> tuple[str, str]:
+    """Split jina reader payload into (title, markdown body)."""
+    title_match = re.search(r"^Title:\s*(.*?)\s*$", payload, re.MULTILINE)
+    title = title_match.group(1).strip() if title_match else ""
+    marker = "Markdown Content:"
+    if marker in payload:
+        body = payload.split(marker, 1)[1].strip()
+    else:
+        body = payload.strip()
+    return title, body
+
+
+async def _direct_extract(urls: List[str], format: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Keyless extraction fallback using the jina reader mirror."""
+    del format  # direct mode always returns markdown-ish text
+
+    async with httpx.AsyncClient(headers=_DIRECT_READER_HEADERS, timeout=45, follow_redirects=True) as client:
+        async def fetch_one(url: str) -> Dict[str, Any]:
+            try:
+                response = await client.get(_direct_reader_url(url))
+                response.raise_for_status()
+                title, content = _extract_reader_markdown(response.text)
+                return {
+                    "url": url,
+                    "title": title,
+                    "content": content,
+                    "raw_content": content,
+                    "metadata": {"sourceURL": url, "title": title, "backend": "direct"},
+                }
+            except Exception as exc:
+                return {
+                    "url": url,
+                    "title": "",
+                    "content": "",
+                    "raw_content": "",
+                    "error": str(exc),
+                    "metadata": {"sourceURL": url, "backend": "direct"},
+                }
+
+        return await asyncio.gather(*(fetch_one(url) for url in urls))
+
+
+def _direct_crawl_search_query(url: str, instructions: Optional[str]) -> str:
+    parsed = urlparse(url)
+    host = parsed.netloc or parsed.path
+    instruction_part = (instructions or "").strip()
+    if instruction_part:
+        return f"site:{host} {instruction_part}"
+    return f"site:{host}"
+
+
+def _select_direct_crawl_urls(seed_url: str, search_results: dict, depth: str) -> List[str]:
+    parsed_seed = urlparse(seed_url)
+    seed_host = parsed_seed.netloc
+    max_results = 8 if depth == "advanced" else 4
+    selected: List[str] = [seed_url]
+
+    for item in search_results.get("data", {}).get("web", []):
+        candidate = item.get("url", "")
+        parsed = urlparse(candidate)
+        if not candidate or not parsed.netloc:
+            continue
+        if parsed.netloc != seed_host:
+            continue
+        if candidate not in selected:
+            selected.append(candidate)
+        if len(selected) >= max_results:
+            break
+
+    return selected
+
+
+async def _direct_crawl(url: str, instructions: Optional[str], depth: str) -> List[Dict[str, Any]]:
+    query = _direct_crawl_search_query(url, instructions)
+    search_results = _direct_search(query, 10)
+    crawl_urls = _select_direct_crawl_urls(url, search_results, depth)
+    return await _direct_extract(crawl_urls, format="markdown")
 
 
 def _to_plain_object(value: Any) -> Any:
@@ -1202,13 +1379,27 @@ def web_search_tool(query: str, limit: int = 5) -> str:
 
         if backend == "tavily":
             logger.info("Tavily search: '%s' (limit: %d)", query, limit)
-            raw = _tavily_request("search", {
-                "query": query,
-                "max_results": min(limit, 20),
-                "include_raw_content": False,
-                "include_images": False,
-            })
-            response_data = _normalize_tavily_search_results(raw)
+            try:
+                raw = _tavily_request("search", {
+                    "query": query,
+                    "max_results": min(limit, 20),
+                    "include_raw_content": False,
+                    "include_images": False,
+                })
+                response_data = _normalize_tavily_search_results(raw)
+            except (httpx.HTTPError, ValueError) as exc:
+                logger.warning("Tavily search failed; falling back to direct search: %s", exc)
+                response_data = _direct_search(query, limit)
+            debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
+            result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
+            debug_call_data["final_response_size"] = len(result_json)
+            _debug.log_call("web_search_tool", debug_call_data)
+            _debug.save()
+            return result_json
+
+        if backend == "direct":
+            logger.info("Direct search fallback: '%s' (limit: %d)", query, limit)
+            response_data = _direct_search(query, limit)
             debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
             result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
             debug_call_data["final_response_size"] = len(result_json)
@@ -1345,11 +1536,15 @@ async def web_extract_tool(
                 results = _exa_extract(safe_urls)
             elif backend == "tavily":
                 logger.info("Tavily extract: %d URL(s)", len(safe_urls))
-                raw = _tavily_request("extract", {
-                    "urls": safe_urls,
-                    "include_images": False,
-                })
-                results = _normalize_tavily_documents(raw, fallback_url=safe_urls[0] if safe_urls else "")
+                try:
+                    raw = _tavily_request("extract", {
+                        "urls": safe_urls,
+                        "include_images": False,
+                    })
+                    results = _normalize_tavily_documents(raw, fallback_url=safe_urls[0] if safe_urls else "")
+                except (httpx.HTTPError, ValueError) as exc:
+                    logger.warning("Tavily extract failed; falling back to direct extract: %s", exc)
+                    results = await _direct_extract(safe_urls, format=format)
             elif backend == "searxng":
                 # SearXNG is search-only — it cannot extract URL content
                 return json.dumps({
@@ -1357,6 +1552,9 @@ async def web_extract_tool(
                     "error": "SearXNG is a search-only backend and cannot extract URL content. "
                              "Set web.extract_backend to firecrawl, tavily, exa, or parallel.",
                 }, ensure_ascii=False)
+            elif backend == "direct":
+                logger.info("Direct extract fallback: %d URL(s)", len(safe_urls))
+                results = await _direct_extract(safe_urls, format=format)
             else:
                 # ── Firecrawl extraction ──
                 # Determine requested formats for Firecrawl v2
@@ -1678,8 +1876,12 @@ async def web_crawl_tool(
             }
             if instructions:
                 payload["instructions"] = instructions
-            raw = _tavily_request("crawl", payload)
-            results = _normalize_tavily_documents(raw, fallback_url=url)
+            try:
+                raw = _tavily_request("crawl", payload)
+                results = _normalize_tavily_documents(raw, fallback_url=url)
+            except (httpx.HTTPError, ValueError) as exc:
+                logger.warning("Tavily crawl failed; falling back to direct crawl: %s", exc)
+                results = await _direct_crawl(url, instructions, depth)
 
             response = {"results": results}
             # Fall through to the shared LLM processing and trimming below
@@ -1739,6 +1941,73 @@ async def web_crawl_tool(
                          "Set FIRECRAWL_API_KEY for crawling, or use web_search instead.",
                 "success": False,
             }, ensure_ascii=False)
+
+        if backend == "direct":
+            if not url.startswith(('http://', 'https://')):
+                url = f'https://{url}'
+
+            if not is_safe_url(url):
+                return json.dumps({"results": [{"url": url, "title": "", "content": "",
+                    "error": "Blocked: URL targets a private or internal network address"}]}, ensure_ascii=False)
+
+            blocked = check_website_access(url)
+            if blocked:
+                logger.info("Blocked web_crawl for %s by rule %s", blocked["host"], blocked["rule"])
+                return json.dumps({"results": [{"url": url, "title": "", "content": "", "error": blocked["message"],
+                    "blocked_by_policy": {"host": blocked["host"], "rule": blocked["rule"], "source": blocked["source"]}}]}, ensure_ascii=False)
+
+            from tools.interrupt import is_interrupted as _is_int
+            if _is_int():
+                return tool_error("Interrupted", success=False)
+
+            logger.info("Direct crawl fallback: %s", url)
+            response = {"results": await _direct_crawl(url, instructions, depth)}
+            pages_crawled = len(response.get('results', []))
+            logger.info("Direct crawl collected %d pages", pages_crawled)
+            debug_call_data["pages_crawled"] = pages_crawled
+            debug_call_data["original_response_size"] = len(json.dumps(response))
+
+            if use_llm_processing and auxiliary_available:
+                logger.info("Processing crawled content with LLM (parallel)...")
+                debug_call_data["processing_applied"].append("llm_processing")
+
+                async def _process_direct_crawl(result):
+                    page_url = result.get('url', 'Unknown URL')
+                    title = result.get('title', '')
+                    content = result.get('content', '')
+                    if not content:
+                        return result, None, "no_content"
+                    original_size = len(content)
+                    processed = await process_content_with_llm(content, page_url, title, effective_model, min_length)
+                    if processed:
+                        result['raw_content'] = content
+                        result['content'] = processed
+                        metrics = {"url": page_url, "original_size": original_size, "processed_size": len(processed),
+                                   "compression_ratio": len(processed) / original_size if original_size else 1.0, "model_used": effective_model}
+                        return result, metrics, "processed"
+                    metrics = {"url": page_url, "original_size": original_size, "processed_size": original_size,
+                               "compression_ratio": 1.0, "model_used": None, "reason": "content_too_short"}
+                    return result, metrics, "too_short"
+
+                tasks = [_process_direct_crawl(r) for r in response.get('results', [])]
+                processed_results = await asyncio.gather(*tasks)
+                for result, metrics, status in processed_results:
+                    if status == "processed":
+                        debug_call_data["compression_metrics"].append(metrics)
+                        debug_call_data["pages_processed_with_llm"] += 1
+
+            if use_llm_processing and not auxiliary_available:
+                logger.warning("LLM processing requested but no auxiliary model available, returning raw content")
+                debug_call_data["processing_applied"].append("llm_processing_unavailable")
+
+            trimmed_results = [{"url": r.get("url", ""), "title": r.get("title", ""), "content": r.get("content", ""), "error": r.get("error"),
+                **({  "blocked_by_policy": r["blocked_by_policy"]} if "blocked_by_policy" in r else {})} for r in response.get("results", [])]
+            result_json = json.dumps({"results": trimmed_results}, indent=2, ensure_ascii=False)
+            cleaned_result = clean_base64_images(result_json)
+            debug_call_data["final_response_size"] = len(cleaned_result)
+            _debug.log_call("web_crawl_tool", debug_call_data)
+            _debug.save()
+            return cleaned_result
 
         # web_crawl requires Firecrawl or the Firecrawl tool-gateway — Parallel has no crawl API
         if not check_firecrawl_api_key():
@@ -2036,8 +2305,8 @@ def check_web_api_key() -> bool:
     """Check whether the configured web backend is available."""
     configured = _load_web_config().get("backend", "").lower().strip()
     if configured in ("exa", "parallel", "firecrawl", "tavily", "searxng"):
-        return _is_backend_available(configured)
-    return any(_is_backend_available(backend) for backend in ("exa", "parallel", "firecrawl", "tavily", "searxng"))
+        return _is_backend_available(configured) or _is_backend_available("direct")
+    return any(_is_backend_available(backend) for backend in ("exa", "parallel", "firecrawl", "tavily", "searxng", "direct"))
 
 
 def check_auxiliary_model() -> bool:

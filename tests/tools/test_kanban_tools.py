@@ -559,8 +559,36 @@ def test_kanban_guidance_in_worker_prompt(monkeypatch, tmp_path):
     assert "Do not shell out" in prompt or "tools — they work" in prompt
 
 
+def test_kanban_guidance_includes_authority_boundary(monkeypatch, tmp_path):
+    """Worker prompts must say Kanban is execution order, not proof authority."""
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_fake")
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    from pathlib import Path as _P
+    monkeypatch.setattr(_P, "home", lambda: tmp_path)
+
+    from run_agent import AIAgent
+    a = AIAgent(
+        api_key="test",
+        base_url="https://openrouter.ai/api/v1",
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+    prompt = a._build_system_prompt().lower()
+
+    # Case-insensitive checks against the rendered guidance; keep these exact
+    # boundary phrases anchored so future edits cannot dilute the policy.
+    assert "kanban governs **execution order, status, coordination, and handoff**" in prompt
+    assert "not** a claim, evidence, or proof authority" in prompt
+    assert "marking a task `done` means" in prompt and "does not certify" in prompt
+    assert "source artifacts" in prompt
+    assert "handoff prose is a pointer to verify, not proof to promote" in prompt
+
+
 def test_kanban_guidance_prompt_size_bounded(monkeypatch, tmp_path):
-    """Sanity: the guidance block is under 4 KB so it doesn't blow
+    """Sanity: the guidance block is under 5 KB so it doesn't blow
     up the cached prompt."""
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_fake")
     home = tmp_path / ".hermes"
@@ -570,7 +598,7 @@ def test_kanban_guidance_prompt_size_bounded(monkeypatch, tmp_path):
     monkeypatch.setattr(_P, "home", lambda: tmp_path)
 
     from agent.prompt_builder import KANBAN_GUIDANCE
-    assert 1_500 < len(KANBAN_GUIDANCE) < 4_096, (
+    assert 1_500 < len(KANBAN_GUIDANCE) < 5_120, (
         f"KANBAN_GUIDANCE is {len(KANBAN_GUIDANCE)} chars — too short (missing?) or too long"
     )
 

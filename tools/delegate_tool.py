@@ -363,7 +363,7 @@ def _get_child_timeout() -> float:
     """Read delegation.child_timeout_seconds from config.
 
     Returns the number of seconds a single child agent is allowed to run
-    before being considered stuck.  Default: 600 s (10 minutes).
+    before being considered stuck.  Default: 1200 s (20 minutes).
     """
     cfg = _load_config()
     val = cfg.get("child_timeout_seconds")
@@ -505,7 +505,7 @@ def _preserve_parent_mcp_toolsets(
 
 
 DEFAULT_MAX_ITERATIONS = 50
-DEFAULT_CHILD_TIMEOUT = 600  # seconds before a child agent is considered stuck
+DEFAULT_CHILD_TIMEOUT = 1200  # seconds before a child agent is considered stuck
 _HEARTBEAT_INTERVAL = 30  # seconds between parent activity heartbeats during delegation
 # Stale-heartbeat thresholds. A child with no API-call progress is either:
 #   - idle between turns (no current_tool) — probably stuck on a slow API call
@@ -513,8 +513,8 @@ _HEARTBEAT_INTERVAL = 30  # seconds between parent activity heartbeats during de
 #     operation (terminal command, web fetch, large file read)
 # The idle ceiling stays tight so genuinely stuck children don't mask the gateway
 # timeout. The in-tool ceiling is much higher so legit long-running tools get
-# time to finish; child_timeout_seconds (default 600s) is still the hard cap.
-_HEARTBEAT_STALE_CYCLES_IDLE = 15  # 15 * 30s = 450s idle between turns → stale
+# time to finish; child_timeout_seconds (default 1200s) is still the hard cap.
+_HEARTBEAT_STALE_CYCLES_IDLE = 5  # 5 * 30s = 150s idle between turns → stale
 _HEARTBEAT_STALE_CYCLES_IN_TOOL = 40  # 40 * 30s = 1200s stuck on same tool → stale
 DEFAULT_TOOLSETS = ["terminal", "file", "web"]
 
@@ -673,6 +673,166 @@ def _strip_blocked_tools(toolsets: List[str]) -> List[str]:
         "code_execution",
     }
     return [t for t in toolsets if t not in blocked_toolset_names]
+
+
+# ---------------------------------------------------------------------------
+# Coding-dispatch — route coding tasks to the local `claude` CLI instead of a
+# Hermes subagent. Falls back to a configured backup provider on failure.
+# Activated via `delegation.coding_dispatch.enabled` in config.yaml.
+# ---------------------------------------------------------------------------
+
+_CODING_DISPATCH_KEYWORDS = frozenset({
+    "code", "coding", "implement", "implementation", "fix", "bug", "debug",
+    "refactor", "function", "class", "module", "repo", "repository", "file",
+    "files", "python", "javascript", "typescript", "rust", "go", "java",
+    "test", "tests", "pytest", "stacktrace", "traceback", "compile", "build",
+})
+
+
+def _coding_dispatch_config(cfg: dict) -> dict:
+    raw = cfg.get("coding_dispatch") or {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def _looks_like_coding_task(goal: str, context: Optional[str], toolsets: Optional[List[str]]) -> bool:
+    toolset_set = {str(t).strip().lower() for t in (toolsets or []) if str(t).strip()}
+    if {"terminal", "file"}.issubset(toolset_set):
+        return True
+    text = f"{goal or ''}\n{context or ''}".lower()
+    words = {token.strip(".,:;!?()[]{}\"'`") for token in text.split()}
+    return bool(words & _CODING_DISPATCH_KEYWORDS)
+
+
+def _should_use_claude_code_dispatch(task: Dict[str, Any], inherited_toolsets: Optional[List[str]], cfg: dict) -> bool:
+    coding_cfg = _coding_dispatch_config(cfg)
+    if not coding_cfg.get("enabled"):
+        return False
+    if task.get("acp_command"):
+        return False
+    task_toolsets = task.get("toolsets") or inherited_toolsets
+    return _looks_like_coding_task(task.get("goal", ""), task.get("context"), task_toolsets)
+
+
+def _resolve_coding_backup_runtime(coding_cfg: dict) -> Optional[dict]:
+    backup_provider = str(coding_cfg.get("backup_provider") or "").strip()
+    backup_model = str(coding_cfg.get("backup_model") or "").strip()
+    if not backup_provider:
+        return None
+    from hermes_cli.runtime_provider import resolve_runtime_provider
+    runtime = resolve_runtime_provider(requested=backup_provider)
+    return {
+        "provider": runtime.get("provider"),
+        "base_url": runtime.get("base_url"),
+        "api_key": runtime.get("api_key"),
+        "api_mode": runtime.get("api_mode"),
+        "command": runtime.get("command"),
+        "args": list(runtime.get("args") or []),
+        "model": backup_model or runtime.get("model") or None,
+    }
+
+
+def _run_backup_subagent(
+    *,
+    task_index: int,
+    goal: str,
+    context: Optional[str],
+    toolsets: Optional[List[str]],
+    parent_agent,
+    backup_runtime: dict,
+    max_iterations: int,
+    saved_parent_tool_names: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    import model_tools as _model_tools
+
+    parent_tool_names = list(saved_parent_tool_names or _model_tools._last_resolved_tool_names)
+    try:
+        child = _build_child_agent(
+            task_index=task_index,
+            goal=goal,
+            context=context,
+            toolsets=toolsets,
+            model=backup_runtime.get("model"),
+            max_iterations=max_iterations,
+            parent_agent=parent_agent,
+            override_provider=backup_runtime.get("provider"),
+            override_base_url=backup_runtime.get("base_url"),
+            override_api_key=backup_runtime.get("api_key"),
+            override_api_mode=backup_runtime.get("api_mode"),
+            override_acp_command=backup_runtime.get("command"),
+            override_acp_args=backup_runtime.get("args"),
+            task_count=1,
+        )
+        child._delegate_saved_tool_names = parent_tool_names
+    finally:
+        _model_tools._last_resolved_tool_names = parent_tool_names
+    result = _run_single_child(task_index, goal, child=child, parent_agent=parent_agent)
+    result["backend"] = "openai-codex-backup"
+    return result
+
+
+def _run_claude_code_task(
+    *,
+    task_index: int,
+    task: Dict[str, Any],
+    parent_agent,
+    primary_model: str,
+    backup_runtime: Optional[dict],
+    max_iterations: int,
+    saved_parent_tool_names: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    from agent.claude_cli_adapter import dispatch_claude_agent
+
+    goal = task.get("goal", "")
+    context = task.get("context")
+    task_toolsets = task.get("toolsets")
+    workspace = _resolve_workspace_hint(parent_agent)
+    system_prompt = _build_child_system_prompt(goal, context, workspace_path=workspace)
+    started = time.monotonic()
+    try:
+        response = dispatch_claude_agent(
+            prompt=goal,
+            cwd=workspace,
+            max_turns=0,
+            model=primary_model or "claude-opus-4-7",
+            system_prompt=system_prompt,
+        )
+        summary = getattr(response.choices[0].message, "content", "") or ""
+        duration = round(time.monotonic() - started, 2)
+        return {
+            "task_index": task_index,
+            "status": "completed" if summary else "failed",
+            "summary": summary,
+            "error": None if summary else "Claude Code returned no summary",
+            "api_calls": 1,
+            "duration_seconds": duration,
+            "backend": "claude-code-cli",
+        }
+    except Exception as exc:
+        logger.warning("Claude Code dispatch failed for task %s: %s", task_index, exc)
+        if backup_runtime:
+            fallback_result = _run_backup_subagent(
+                task_index=task_index,
+                goal=goal,
+                context=context,
+                toolsets=task_toolsets,
+                parent_agent=parent_agent,
+                backup_runtime=backup_runtime,
+                max_iterations=max_iterations,
+                saved_parent_tool_names=saved_parent_tool_names,
+            )
+            fallback_result["error"] = str(exc)
+            fallback_result["fallback_from"] = "claude-code-cli"
+            return fallback_result
+        duration = round(time.monotonic() - started, 2)
+        return {
+            "task_index": task_index,
+            "status": "error",
+            "summary": None,
+            "error": str(exc),
+            "api_calls": 0,
+            "duration_seconds": duration,
+            "backend": "claude-code-cli",
+        }
 
 
 def _build_child_progress_callback(
@@ -1949,6 +2109,18 @@ def delegate_task(
     except ValueError as exc:
         return tool_error(str(exc))
 
+    # Coding-dispatch: opt-in routing of coding tasks to the local `claude` CLI
+    # (see _should_use_claude_code_dispatch / _run_claude_code_task).  Backup
+    # runtime resolves a Hermes-subagent provider used as a fallback when the
+    # claude CLI fails.  Absent or disabled config → coding-dispatch off.
+    coding_cfg = _coding_dispatch_config(cfg)
+    backup_runtime = None
+    if coding_cfg.get("enabled"):
+        try:
+            backup_runtime = _resolve_coding_backup_runtime(coding_cfg)
+        except Exception as exc:
+            logger.warning("Could not resolve coding-dispatch backup runtime: %s", exc)
+
     # Normalize to task list
     max_children = _get_max_concurrent_children()
     if tasks and isinstance(tasks, list):
@@ -1996,6 +2168,12 @@ def delegate_task(
     children = []
     try:
         for i, t in enumerate(task_list):
+            # Coding-dispatch: route to the claude CLI instead of building a
+            # Hermes subagent.  Marker is `child is None` in the children list;
+            # downstream dispatch checks for this and calls _run_claude_code_task.
+            if _should_use_claude_code_dispatch(t, toolsets, cfg):
+                children.append((i, t, None))
+                continue
             task_acp_args = t.get("acp_args") if "acp_args" in t else None
             # Per-task role beats top-level; normalise again so unknown
             # per-task values warn and degrade to leaf uniformly.
@@ -2033,7 +2211,19 @@ def delegate_task(
     if n_tasks == 1:
         # Single task -- run directly (no thread pool overhead)
         _i, _t, child = children[0]
-        result = _run_single_child(0, _t["goal"], child, parent_agent)
+        if child is None:
+            # Coding-dispatch plan — route through the claude CLI
+            result = _run_claude_code_task(
+                task_index=0,
+                task=_t,
+                parent_agent=parent_agent,
+                primary_model=str(coding_cfg.get("primary_model") or "claude-opus-4-7"),
+                backup_runtime=backup_runtime,
+                max_iterations=effective_max_iter,
+                saved_parent_tool_names=_parent_tool_names,
+            )
+        else:
+            result = _run_single_child(0, _t["goal"], child, parent_agent)
         results.append(result)
     else:
         # Batch -- run in parallel with per-task progress lines
@@ -2043,13 +2233,26 @@ def delegate_task(
         with ThreadPoolExecutor(max_workers=max_children) as executor:
             futures = {}
             for i, t, child in children:
-                future = executor.submit(
-                    _run_single_child,
-                    task_index=i,
-                    goal=t["goal"],
-                    child=child,
-                    parent_agent=parent_agent,
-                )
+                if child is None:
+                    # Coding-dispatch plan — route through the claude CLI
+                    future = executor.submit(
+                        _run_claude_code_task,
+                        task_index=i,
+                        task=t,
+                        parent_agent=parent_agent,
+                        primary_model=str(coding_cfg.get("primary_model") or "claude-opus-4-7"),
+                        backup_runtime=backup_runtime,
+                        max_iterations=effective_max_iter,
+                        saved_parent_tool_names=_parent_tool_names,
+                    )
+                else:
+                    future = executor.submit(
+                        _run_single_child,
+                        task_index=i,
+                        goal=t["goal"],
+                        child=child,
+                        parent_agent=parent_agent,
+                    )
                 futures[future] = i
 
             # Poll futures with interrupt checking.  as_completed() blocks
@@ -2565,7 +2768,7 @@ DELEGATE_TASK_SCHEMA = {
                 "items": {"type": "string"},
                 "description": (
                     "Arguments for the ACP command (default: ['--acp', '--stdio']). "
-                    "Only used when acp_command is set."
+                    "Only used when acp_command is set. Example: ['--acp', '--stdio', '--model', 'claude-opus-4-7']"
                 ),
             },
         },

@@ -306,3 +306,44 @@ def test_explicit_non_stream_stale_timeout_is_honored_for_local_endpoints(monkey
     )
 
     assert agent._compute_non_stream_stale_timeout([]) == 300.0
+
+
+def test_codex_timeout_short_circuit_is_scoped_to_openai_codex(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / ".env").write_text("", encoding="utf-8")
+
+    from agent.error_classifier import classify_api_error
+    from run_agent import AIAgent
+
+    codex_agent = AIAgent(
+        model="gpt-5.5",
+        provider="openai-codex",
+        api_key="sk-dummy",
+        base_url="https://chatgpt.com/backend-api/codex",
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+        platform="cli",
+    )
+    timeout_error = TimeoutError("Non-streaming API call timed out after 900s")
+    classified = classify_api_error(
+        timeout_error,
+        provider="openai-codex",
+        model="gpt-5.5",
+        approx_tokens=1000,
+        context_length=272000,
+        num_messages=1,
+    )
+    assert codex_agent._should_short_circuit_api_timeout_retry(timeout_error, classified) is True
+
+    other_agent = AIAgent(
+        model="openai/gpt-4o-mini",
+        provider="openrouter",
+        api_key="sk-dummy",
+        base_url="https://openrouter.ai/api/v1",
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+        platform="cli",
+    )
+    assert other_agent._should_short_circuit_api_timeout_retry(timeout_error, classified) is False

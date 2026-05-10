@@ -541,6 +541,10 @@ class MemoryManager:
         Automatically injects ``hermes_home`` into *kwargs* so that every
         provider can resolve profile-scoped storage paths without importing
         ``get_hermes_home()`` themselves.
+
+        After initialization, re-indexes ``_tool_to_provider`` because some
+        providers (e.g. ChromaDB) gate ``get_tool_schemas()`` on availability
+        which is only set during ``initialize()``.
         """
         if "hermes_home" not in kwargs:
             from hermes_constants import get_hermes_home
@@ -551,5 +555,25 @@ class MemoryManager:
             except Exception as e:
                 logger.warning(
                     "Memory provider '%s' initialize failed: %s",
+                    provider.name, e,
+                )
+
+        # Re-index tool schemas → provider mapping.  Providers like ChromaDB
+        # return empty schemas from get_tool_schemas() until they are
+        # initialized and connected, so the index built during add_provider()
+        # may be incomplete.
+        for provider in self._providers:
+            try:
+                for schema in provider.get_tool_schemas():
+                    tool_name = schema.get("name", "")
+                    if tool_name and tool_name not in self._tool_to_provider:
+                        self._tool_to_provider[tool_name] = provider
+                        logger.debug(
+                            "Post-init tool index: '%s' → provider '%s'",
+                            tool_name, provider.name,
+                        )
+            except Exception as e:
+                logger.debug(
+                    "Post-init tool re-index for '%s' failed: %s",
                     provider.name, e,
                 )

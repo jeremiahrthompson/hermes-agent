@@ -291,6 +291,8 @@ When a worker on task B is spawned and calls `kanban_show()`, the `worker_contex
 
 This replaces the "dig through comments and the work output" dance that plagues flat kanban systems. A PM writes acceptance criteria in the spec's metadata, and the engineer's worker sees them structurally in the parent handoff. An engineer records which tests they ran and how many passed, and the reviewer's worker has that list in hand before opening a diff.
 
+Those fields are worker claims about the work, not independent verification of the work. In regulated, safety-critical, financial, security, or research workflows, `summary` and `metadata` should point at source artifacts (commits, tests, datasets, citations, signed receipts, review records), and downstream tasks should verify against those artifacts instead of promoting upstream prose to proof.
+
 The bulk-close guard exists because this data is per-run. `hermes kanban complete a b c --summary X` (you, from the CLI) is refused — copy-pasting the same summary to three tasks is almost always wrong. Bulk close without the handoff flags still works for the common "I finished a pile of admin tasks" case. The tool surface doesn't expose a bulk variant at all; `kanban_complete` is always single-task-at-a-time for the same reason.
 
 ## Inspecting a task currently running
