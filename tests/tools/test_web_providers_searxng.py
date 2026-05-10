@@ -280,6 +280,11 @@ class TestCheckWebApiKey:
         assert web_tools.check_web_api_key() is True
 
     def test_no_credentials_fails(self, monkeypatch):
+        # After the upstream direct-fallback merge (PR #1 + v2026.5.7),
+        # check_web_api_key() reports True when DuckDuckGo + jina direct
+        # mode is available even with no API keys configured. To preserve
+        # the original "no service" intent of this test, mock the direct
+        # backend as unavailable as well.
         from tools import web_tools
         monkeypatch.setattr(web_tools, "_load_web_config", lambda: {})
         monkeypatch.delenv("FIRECRAWL_API_KEY", raising=False)
@@ -290,6 +295,15 @@ class TestCheckWebApiKey:
         monkeypatch.delenv("SEARXNG_URL", raising=False)
         monkeypatch.setattr(web_tools, "_is_tool_gateway_ready", lambda: False)
         monkeypatch.setattr(web_tools, "check_firecrawl_api_key", lambda: False)
+        # Mock direct backend as unavailable to assert the no-real-service
+        # signal independent of the keyless DuckDuckGo+jina fallback path.
+        original_is_available = web_tools._is_backend_available
+
+        def _patched_available(backend):
+            if backend == "direct":
+                return False
+            return original_is_available(backend)
+        monkeypatch.setattr(web_tools, "_is_backend_available", _patched_available)
         assert web_tools.check_web_api_key() is False
 
 
