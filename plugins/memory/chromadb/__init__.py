@@ -165,6 +165,13 @@ class ChromaDBMemoryProvider(MemoryProvider):
         # Cron guard
         self._cron_skipped = False
 
+        # Phase 1 / Lane B: generated profile prompt transport. Core sets
+        # these via initialize(**kwargs); the plugin never reads
+        # hermes_cli.config directly.
+        self._prompt_source: str = "legacy"
+        self._generated_profile_enabled: bool = False
+        self._agent_context: str = "primary"
+
     @property
     def name(self) -> str:
         return "chromadb"
@@ -230,6 +237,14 @@ class ChromaDBMemoryProvider(MemoryProvider):
             self._session_id = session_id
             self._hermes_home = kwargs.get("hermes_home", "")
             self._agent_name = kwargs.get("agent_identity", "rilo")
+            # Phase 1 transport: core tells the plugin which prompt-source
+            # mode is active and whether generated profile is enabled, via
+            # initialize kwargs.  The plugin must not import core config.
+            self._agent_context = str(agent_context or "primary")
+            self._prompt_source = str(kwargs.get("prompt_source", "legacy") or "legacy")
+            self._generated_profile_enabled = bool(
+                kwargs.get("generated_prompt_enabled", False)
+            )
 
             # Load config
             from plugins.memory.chromadb.config import ChromaDBConfig
@@ -334,7 +349,18 @@ class ChromaDBMemoryProvider(MemoryProvider):
     # -- System prompt block ------------------------------------------------
 
     def system_prompt_block(self) -> str:
-        """Return team knowledge context for the system prompt."""
+        """Return team knowledge context for the system prompt.
+
+        Phase 1 (Lane B): may additionally append a bounded
+        ``<memory-profile>`` block generated from vector memory when
+        ``prompt_source`` selects ``provider_with_legacy_fallback`` or
+        ``provider``.  In ``shadow`` mode the block is generated and cached
+        but NOT included in the returned text — operators get the
+        cache/debug artifact without changing the live prompt.
+
+        Team-knowledge injection is invariant across all prompt-source
+        modes (plan §"Generated Prompt Block Contract").
+        """
         if self._cron_skipped or not self._available:
             return ""
 
@@ -348,7 +374,132 @@ class ChromaDBMemoryProvider(MemoryProvider):
         if self._team_context:
             parts.append(f"\n## Team Knowledge\n{self._team_context}")
 
+        generated = self._build_generated_profile_block()
+        if generated:
+            parts.append(generated)
+
         return "\n".join(parts)
+
+    # -- Generated profile (Phase 1 / Lane B) -------------------------------
+
+    def _generated_profile_should_run(self) -> bool:
+        """Gate every condition described in the plan in one place."""
+        if self._cron_skipped or not self._available:
+            return False
+        if not self._generated_profile_enabled:
+            return False
+        if self._prompt_source == "legacy":
+            return False
+        if self._agent_context in ("cron", "subagent", "flush"):
+            return False
+        if self._config is None:
+            return False
+        return True
+
+    def _search_for_generated(self, target: str) -> List[Dict[str, Any]]:
+        """Run a single ``_query()`` for the target and return ranked facts.
+
+        Tests monkeypatch ``_query``/``_embed`` directly on the provider
+        instance, so this method must go through ``self._query(...)`` and
+        never call ``collection.query(...)`` directly.
+        """
+        from plugins.memory.chromadb.prompt_profile import rank_facts
+
+        gp = self._config.generated_profile  # type: ignore[union-attr]
+        if target == "user":
+            query = gp.user_query
+            n = max(1, int(gp.max_user_facts))
+        else:
+            query = gp.memory_query
+            n = max(1, int(gp.max_memory_facts))
+
+        collection = self._get_collection(target)
+        if collection is None:
+            return []
+        try:
+            raw = self._query(
+                collection,
+                query,
+                n_results=n,
+                where={"target": target},
+            )
+        except Exception as e:
+            logger.debug("ChromaDB generated profile query for %s failed: %s", target, e)
+            raise
+        formatted = self._format_results(raw)
+        return rank_facts(formatted, min_confidence=gp.min_confidence)
+
+    def _build_generated_profile_block(self) -> str:
+        """Generate, cache, and (optionally) return the ``<memory-profile>`` block.
+
+        Returns empty string when the generated path should not run or
+        when generation fails — never raises.  Cache writes happen even in
+        ``shadow`` mode; cache reads/fallback are wired in Phase 2.
+        """
+        if not self._generated_profile_should_run():
+            return ""
+
+        try:
+            from plugins.memory.chromadb.prompt_profile import (
+                compute_cache_key,
+                render_profile_block,
+            )
+            from plugins.memory.chromadb.prompt_cache import write_cache
+
+            gp = self._config.generated_profile  # type: ignore[union-attr]
+
+            user_facts = self._search_for_generated("user")
+            memory_facts = self._search_for_generated("memory")
+
+            collection_names = sorted((self._config.collections or {}).values())  # type: ignore[union-attr]
+            selected_ids = [f.get("id", "") for f in user_facts + memory_facts]
+            cache_key = compute_cache_key(
+                profile=self._agent_name,
+                collection_names=collection_names,
+                selected_fact_ids=selected_ids,
+                config_version=gp.config_version,
+            )
+
+            no_selected_facts = not user_facts and not memory_facts
+            block, receipt = render_profile_block(
+                user_facts=user_facts,
+                memory_facts=memory_facts,
+                max_user_chars=gp.max_user_chars,
+                max_memory_chars=gp.max_memory_chars,
+                cache_key=cache_key,
+                degraded=no_selected_facts,
+                include_debug_header=False,
+            )
+
+            if self._hermes_home:
+                try:
+                    write_cache(
+                        self._hermes_home,
+                        profile=self._agent_name,
+                        cache_key=cache_key,
+                        target="profile",
+                        payload={
+                            "block": block,
+                            "receipt": receipt,
+                            "generated_at": time.time(),
+                        },
+                    )
+                except Exception as e:
+                    logger.debug("ChromaDB cache write failed: %s", e)
+
+            # Shadow mode: cache only, never alter the returned prompt block.
+            if self._prompt_source == "shadow":
+                return ""
+            if self._prompt_source in ("provider_with_legacy_fallback", "provider"):
+                return block
+            return ""
+        except Exception as e:
+            # Any failure — embeddings unreachable, query backend down,
+            # rendering error — downgrades the generated path to empty.
+            # Legacy / team-knowledge text in system_prompt_block is
+            # unaffected.
+            logger.debug("ChromaDB generated profile failed: %s — degrading", e)
+            return ""
 
     # -- Prefetch (semantic recall) -----------------------------------------
 
@@ -433,6 +584,28 @@ class ChromaDBMemoryProvider(MemoryProvider):
         if self._cron_skipped or not self._available or not content:
             return
 
+        # Invalidate cached generated profile for the affected target so
+        # the next session prompt build picks up fresh content (plan
+        # global rule §14).  Best-effort — never raises.
+        if target in ("user", "memory") and self._hermes_home:
+            try:
+                from plugins.memory.chromadb.prompt_cache import invalidate_target
+                invalidate_target(
+                    self._hermes_home,
+                    profile=self._agent_name,
+                    target=target,
+                )
+                # Generated profile caches combine user + memory facts into a
+                # target="profile" artifact; any user/memory mutation makes
+                # that combined artifact stale too.
+                invalidate_target(
+                    self._hermes_home,
+                    profile=self._agent_name,
+                    target="profile",
+                )
+            except Exception as e:
+                logger.debug("ChromaDB cache invalidation failed: %s", e)
+
         def _write():
             try:
                 if action == "add":
@@ -452,8 +625,13 @@ class ChromaDBMemoryProvider(MemoryProvider):
     # -- Tool schemas -------------------------------------------------------
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
-        """Return team_memory and vector_search tool schemas."""
-        if self._cron_skipped or not self._available:
+        """Return team_memory and vector_search tool schemas.
+
+        Tool routing is registered before provider initialization completes, so
+        schemas must be exposed even while `_available` is still False. Runtime
+        calls still fail closed in `handle_tool_call()` if ChromaDB is not ready.
+        """
+        if self._cron_skipped:
             return []
         return [TEAM_MEMORY_SCHEMA, VECTOR_SEARCH_SCHEMA]
 
