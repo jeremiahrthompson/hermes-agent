@@ -16,6 +16,83 @@ from typing import Any, Dict, Optional
 logger = logging.getLogger(__name__)
 
 
+# Phase 1 hard defaults for the generated profile path. These are
+# intentionally conservative — keys missing from chromadb.json must use
+# these values without raising.  The core memory.generated_prompt
+# config block decides whether generation runs at all.
+_GP_DEFAULT_USER_QUERY = (
+    "stable user preferences identity roles family constraints durable corrections"
+)
+_GP_DEFAULT_MEMORY_QUERY = (
+    "stable operating conventions infrastructure project preferences durable lessons"
+)
+
+
+@dataclass
+class GeneratedProfileConfig:
+    """Provider-local tuning for the generated profile block.
+
+    Enabled by default because core defaults use the safe
+    ``provider_with_legacy_fallback`` mode: legacy MEMORY/USER markdown remains
+    injected unless the provider returns a non-degraded generated profile.
+    These knobs only refine retrieval/render behavior.
+    """
+
+    enabled: bool = True
+    user_query: str = _GP_DEFAULT_USER_QUERY
+    memory_query: str = _GP_DEFAULT_MEMORY_QUERY
+    max_user_facts: int = 20
+    max_memory_facts: int = 30
+    min_confidence: float = 0.0
+    include_team_knowledge: bool = False
+    # Char budgets default to current legacy USER.md / MEMORY.md limits so
+    # the byte-compat gate in Phase 2 has a stable reference.
+    max_user_chars: int = 1375
+    max_memory_chars: int = 2200
+    cache_ttl_seconds: int = 86400
+    fallback_to_cache: bool = True
+    config_version: str = "v1"
+
+    @classmethod
+    def from_dict(cls, data: Optional[Dict[str, Any]]) -> "GeneratedProfileConfig":
+        if not data or not isinstance(data, dict):
+            return cls()
+        try:
+            return cls(
+                enabled=bool(data.get("enabled", True)),
+                user_query=str(data.get("user_query", _GP_DEFAULT_USER_QUERY)),
+                memory_query=str(data.get("memory_query", _GP_DEFAULT_MEMORY_QUERY)),
+                max_user_facts=int(data.get("max_user_facts", 20)),
+                max_memory_facts=int(data.get("max_memory_facts", 30)),
+                min_confidence=float(data.get("min_confidence", 0.0)),
+                include_team_knowledge=bool(data.get("include_team_knowledge", False)),
+                max_user_chars=int(data.get("max_user_chars", 1375)),
+                max_memory_chars=int(data.get("max_memory_chars", 2200)),
+                cache_ttl_seconds=int(data.get("cache_ttl_seconds", 86400)),
+                fallback_to_cache=bool(data.get("fallback_to_cache", True)),
+                config_version=str(data.get("config_version", "v1")),
+            )
+        except (TypeError, ValueError) as e:
+            logger.debug("Invalid generated_profile keys, using defaults: %s", e)
+            return cls()
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "user_query": self.user_query,
+            "memory_query": self.memory_query,
+            "max_user_facts": self.max_user_facts,
+            "max_memory_facts": self.max_memory_facts,
+            "min_confidence": self.min_confidence,
+            "include_team_knowledge": self.include_team_knowledge,
+            "max_user_chars": self.max_user_chars,
+            "max_memory_chars": self.max_memory_chars,
+            "cache_ttl_seconds": self.cache_ttl_seconds,
+            "fallback_to_cache": self.fallback_to_cache,
+            "config_version": self.config_version,
+        }
+
+
 @dataclass
 class ChromaDBConfig:
     """Configuration for the ChromaDB vector memory plugin."""
@@ -45,6 +122,8 @@ class ChromaDBConfig:
     default_char_budget: int = 2200
     # Agent identity (set during initialize)
     agent_name: str = "rilo"
+    # Provider-local tuning for the generated profile block (Phase 1 / Lane B)
+    generated_profile: GeneratedProfileConfig = field(default_factory=GeneratedProfileConfig)
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "ChromaDBConfig":
@@ -78,6 +157,7 @@ class ChromaDBConfig:
             importance_weight=float(data.get("importance_weight", 0.2)),
             default_char_budget=int(data.get("default_char_budget", 2200)),
             agent_name=str(data.get("agent_name", "rilo")),
+            generated_profile=GeneratedProfileConfig.from_dict(data.get("generated_profile")),
         )
 
     @classmethod
@@ -110,4 +190,5 @@ class ChromaDBConfig:
             "importance_weight": self.importance_weight,
             "default_char_budget": self.default_char_budget,
             "agent_name": self.agent_name,
+            "generated_profile": self.generated_profile.to_dict(),
         }

@@ -280,6 +280,35 @@ class MemoryManager:
                 )
         return "\n\n".join(blocks)
 
+    def external_system_prompt_block(self) -> str:
+        """Return the system prompt block from the single external provider.
+
+        Core prompt-source policy (run_agent._build_system_prompt_parts) calls
+        this when it needs to decide whether to suppress legacy MEMORY/USER
+        markdown blocks. Only the non-builtin provider contributes — builtin
+        status text remains additive in all modes.
+
+        Returns the empty string if there is no external provider, the
+        provider returned an empty block, or the provider raised. Errors
+        are logged and swallowed so the caller can fall back to legacy
+        memory without re-implementing exception handling.
+        """
+        for provider in self._providers:
+            if provider.name == "builtin":
+                continue
+            try:
+                block = provider.system_prompt_block()
+            except Exception as e:
+                logger.warning(
+                    "Memory provider '%s' system_prompt_block() failed: %s",
+                    provider.name, e,
+                )
+                return ""
+            if block and block.strip():
+                return block
+            return ""
+        return ""
+
     # -- Prefetch / recall ---------------------------------------------------
 
     def prefetch_all(self, query: str, *, session_id: str = "") -> str:
@@ -470,11 +499,11 @@ class MemoryManager:
 
         accepted = [
             p for p in params
-            if p.kind in (
+            if p.kind in {
                 inspect.Parameter.POSITIONAL_ONLY,
                 inspect.Parameter.POSITIONAL_OR_KEYWORD,
                 inspect.Parameter.KEYWORD_ONLY,
-            )
+            }
         ]
         if len(accepted) >= 4:
             return "positional"

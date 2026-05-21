@@ -897,6 +897,166 @@ def test_named_custom_provider_does_not_shadow_builtin_provider(monkeypatch):
     assert resolved["requested_provider"] == "nous"
 
 
+def test_resolve_runtime_provider_nous_uses_env_api_key_without_portal(monkeypatch):
+    class _Pool:
+        def has_credentials(self):
+            return False
+
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "nous")
+    monkeypatch.setattr(rp, "_get_model_config", lambda: {"provider": "nous"})
+    monkeypatch.setattr(rp, "load_pool", lambda provider: _Pool())
+    monkeypatch.setenv("NOUS_API_KEY", "env-nous-key")
+    monkeypatch.delenv("NOUS_INFERENCE_BASE_URL", raising=False)
+
+    def _unexpected_portal_resolution(**kwargs):
+        raise AssertionError("NOUS_API_KEY should resolve before portal OAuth")
+
+    monkeypatch.setattr(
+        rp,
+        "resolve_nous_runtime_credentials",
+        _unexpected_portal_resolution,
+    )
+
+    resolved = rp.resolve_runtime_provider(requested="nous")
+
+    assert resolved["provider"] == "nous"
+    assert resolved["api_mode"] == "chat_completions"
+    assert resolved["base_url"] == "https://inference-api.nousresearch.com/v1"
+    assert resolved["api_key"] == "env-nous-key"
+    assert resolved["source"] == "env:NOUS_API_KEY"
+    assert resolved["requested_provider"] == "nous"
+
+
+def test_resolve_runtime_provider_nous_explicit_api_key_wins_over_env(monkeypatch):
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "nous")
+    monkeypatch.setattr(rp, "_get_model_config", lambda: {"provider": "nous"})
+    monkeypatch.setattr(
+        rp,
+        "load_pool",
+        lambda provider: type("Pool", (), {"has_credentials": lambda self: False})(),
+    )
+    monkeypatch.setenv("NOUS_API_KEY", "env-nous-key")
+    monkeypatch.setattr(
+        rp.auth_mod,
+        "get_provider_auth_state",
+        lambda provider: {"inference_base_url": "https://inference-api.nousresearch.com/v1"},
+    )
+
+    def _unexpected_portal_resolution(**kwargs):
+        raise AssertionError("explicit Nous api_key should resolve before portal OAuth")
+
+    monkeypatch.setattr(rp, "resolve_nous_runtime_credentials", _unexpected_portal_resolution)
+
+    resolved = rp.resolve_runtime_provider(
+        requested="nous",
+        explicit_api_key="explicit-nous-key",
+        explicit_base_url="https://explicit-nous.example.com/v1",
+    )
+
+    assert resolved["provider"] == "nous"
+    assert resolved["api_key"] == "explicit-nous-key"
+    assert resolved["base_url"] == "https://explicit-nous.example.com/v1"
+    assert resolved["source"] == "explicit"
+
+
+def test_resolve_runtime_provider_nous_accepts_manual_api_key_pool_entry(monkeypatch):
+    class _Entry:
+        provider = "nous"
+        access_token = "manual-nous-key"
+        auth_type = "api_key"
+        source = "manual"
+        base_url = "https://inference-api.nousresearch.com/v1"
+        inference_base_url = "https://inference-api.nousresearch.com/v1"
+        agent_key = None
+        agent_key_expires_at = None
+
+        @property
+        def runtime_api_key(self):
+            return self.agent_key or self.access_token
+
+        @property
+        def runtime_base_url(self):
+            return self.inference_base_url or self.base_url
+
+    class _Pool:
+        def has_credentials(self):
+            return True
+
+        def select(self):
+            return _Entry()
+
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "nous")
+    monkeypatch.setattr(rp, "_get_model_config", lambda: {"provider": "nous"})
+    monkeypatch.setattr(rp, "load_pool", lambda provider: _Pool())
+    monkeypatch.delenv("NOUS_API_KEY", raising=False)
+
+    def _unexpected_portal_resolution(**kwargs):
+        raise AssertionError("manual Nous API-key pool entry should resolve before portal OAuth")
+
+    monkeypatch.setattr(
+        rp,
+        "resolve_nous_runtime_credentials",
+        _unexpected_portal_resolution,
+    )
+
+    resolved = rp.resolve_runtime_provider(requested="nous")
+
+    assert resolved["provider"] == "nous"
+    assert resolved["api_key"] == "manual-nous-key"
+    assert resolved["source"] == "manual"
+    assert resolved["base_url"] == "https://inference-api.nousresearch.com/v1"
+
+
+def test_resolve_runtime_provider_nous_oauth_pool_does_not_send_access_token(monkeypatch):
+    class _Entry:
+        provider = "nous"
+        access_token = "portal-oauth-access-token"
+        auth_type = "oauth"
+        source = "device_code"
+        base_url = "https://inference-api.nousresearch.com/v1"
+        inference_base_url = "https://inference-api.nousresearch.com/v1"
+        agent_key = None
+        agent_key_expires_at = None
+
+        @property
+        def runtime_api_key(self):
+            return self.agent_key or self.access_token
+
+        @property
+        def runtime_base_url(self):
+            return self.inference_base_url or self.base_url
+
+    class _Pool:
+        def has_credentials(self):
+            return True
+
+        def select(self):
+            return _Entry()
+
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "nous")
+    monkeypatch.setattr(rp, "_get_model_config", lambda: {"provider": "nous"})
+    monkeypatch.setattr(rp, "load_pool", lambda provider: _Pool())
+    monkeypatch.delenv("NOUS_API_KEY", raising=False)
+    monkeypatch.setattr(rp, "_agent_key_is_usable", lambda state, min_ttl: False)
+    monkeypatch.setattr(
+        rp,
+        "resolve_nous_runtime_credentials",
+        lambda **kwargs: {
+            "base_url": "https://inference-api.nousresearch.com/v1",
+            "api_key": "fresh-agent-key",
+            "source": "portal",
+            "expires_at": None,
+        },
+    )
+
+    resolved = rp.resolve_runtime_provider(requested="nous")
+
+    assert resolved["provider"] == "nous"
+    assert resolved["api_key"] == "fresh-agent-key"
+    assert resolved["api_key"] != "portal-oauth-access-token"
+    assert resolved["source"] == "portal"
+
+
 def test_named_custom_provider_wins_over_builtin_alias(monkeypatch):
     """A custom_providers entry named after a built-in *alias* (not a canonical
     provider name) must win over the built-in.  Regression guard for #15743:
@@ -2285,3 +2445,39 @@ def test_minimax_oauth_runtime_uses_inference_base_url(monkeypatch):
     resolved = rp.resolve_runtime_provider(requested="minimax-oauth")
 
     assert MINIMAX_OAUTH_CN_INFERENCE.rstrip("/") in resolved["base_url"]
+
+
+def test_minimax_oauth_pool_forces_anthropic_messages_despite_stale_config(monkeypatch):
+    """A pooled MiniMax OAuth token must not inherit stale chat_completions config."""
+
+    class _Entry:
+        access_token = "oauth-token"
+        source = "manual:minimax_oauth"
+        base_url = "https://api.minimax.io/anthropic"
+
+    class _Pool:
+        def has_credentials(self):
+            return True
+
+        def select(self):
+            return _Entry()
+
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "minimax-oauth")
+    monkeypatch.setattr(
+        rp,
+        "_get_model_config",
+        lambda: {
+            "provider": "minimax-oauth",
+            "default": "MiniMax-M2.7",
+            "api_mode": "chat_completions",
+        },
+    )
+    monkeypatch.setattr(rp, "load_pool", lambda provider: _Pool())
+    monkeypatch.setattr(rp, "_resolve_named_custom_runtime", lambda **k: None)
+    monkeypatch.setattr(rp, "_resolve_explicit_runtime", lambda **k: None)
+
+    resolved = rp.resolve_runtime_provider(requested="minimax-oauth")
+
+    assert resolved["provider"] == "minimax-oauth"
+    assert resolved["api_mode"] == "anthropic_messages"
+    assert resolved["base_url"] == "https://api.minimax.io/anthropic"
