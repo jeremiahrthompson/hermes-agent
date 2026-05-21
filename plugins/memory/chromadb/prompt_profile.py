@@ -114,18 +114,20 @@ def sanitize_fact(text: str) -> Tuple[str, bool]:
 # Ranking
 # ---------------------------------------------------------------------------
 
-# Static composite-score weights (mirrors ChromaDBConfig defaults).  Kept
-# local so the renderer stays a pure function and does not depend on a
-# provider instance.
-_W_SIM = 0.5
-_W_REC = 0.3
-_W_IMP = 0.2
-_RECENCY_WINDOW = 30 * 24 * 3600  # 30d, matches provider _score_results
-
+# Static G1A v1 score weights live in plugins.memory.chromadb.g1a.  This
+# renderer imports the shared helper at score time so provider scoring and
+# deterministic profile rendering cannot drift.
 _INACTIVE_STATUSES = {"inactive", "archived", "stale", "deleted"}
 
 
 def _score(fact: Dict[str, Any], *, now: float) -> float:
+    from plugins.memory.chromadb.g1a import score_result
+
+    return float(score_result(fact, now=now).get("composite_score", 0.0))
+
+
+def _score_pre_g1a(fact: Dict[str, Any], *, now: float) -> float:
+    """Exact pre-G1A deterministic profile score for kill-switch identity."""
     meta = fact.get("metadata") or {}
     distance = fact.get("distance", 1.0)
     try:
@@ -140,7 +142,7 @@ def _score(fact: Dict[str, Any], *, now: float) -> float:
     except (TypeError, ValueError):
         stored_at = now
     age = max(0.0, now - stored_at)
-    recency = max(0.0, 1.0 - (age / _RECENCY_WINDOW))
+    recency = max(0.0, 1.0 - (age / (30 * 24 * 3600)))
 
     importance = meta.get("importance", 0.5)
     try:
@@ -149,7 +151,7 @@ def _score(fact: Dict[str, Any], *, now: float) -> float:
         importance = 0.5
     importance = max(0.0, min(1.0, importance))
 
-    return _W_SIM * similarity + _W_REC * recency + _W_IMP * importance
+    return 0.5 * similarity + 0.3 * recency + 0.2 * importance
 
 
 def _is_superseded_or_inactive(fact: Dict[str, Any]) -> bool:
@@ -167,6 +169,7 @@ def rank_facts(
     *,
     min_confidence: float = 0.0,
     now: Optional[float] = None,
+    legacy_pre_g1a: bool = False,
 ) -> List[Dict[str, Any]]:
     """Filter superseded/inactive/low-confidence facts and sort by score.
 
@@ -187,7 +190,7 @@ def rank_facts(
                 conf = 1.0  # treat unparsable as no signal — keep
             if conf < min_confidence:
                 continue
-        score = _score(fact, now=now)
+        score = _score_pre_g1a(fact, now=now) if legacy_pre_g1a else _score(fact, now=now)
         kept.append((score, fact))
     kept.sort(key=lambda x: x[0], reverse=True)
     return [f for _, f in kept]

@@ -381,7 +381,7 @@ def test_cache_file_excludes_raw_embedding_vectors(tmp_path):
             "embeddings": [[0.1, 0.2]],
             "vectors": [[0.3]],
         },
-        "generated_at": time.time(),
+        "generated_at": 2.0,
     }
     path = write_cache(str(tmp_path), profile="rilo", cache_key="novec", payload=payload)
 
@@ -494,6 +494,7 @@ def _make_provider_with_fakes(monkeypatch, *, prompt_source="shadow",
     provider._session_id = "session-test"
     provider._prompt_source = prompt_source
     provider._generated_profile_enabled = generated_enabled
+    provider._boot_synthesis_enabled = False
     provider._agent_context = agent_context
 
     # Fake collection that no test actually queries (we patch _query directly).
