@@ -944,6 +944,43 @@ class ChromaDBMemoryProvider(MemoryProvider):
             logger.warning("vector_search failed: %s", e)
             return json.dumps({"error": f"Vector search failed: {e}"})
 
+    # -- Turn-start observability --------------------------------------------
+
+    def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
+        """Append local G1B correction-marker feedback events.
+
+        This hook is intentionally independent of Chroma availability. It does
+        not touch vector stores or flat-file memory; it only appends structured,
+        raw-text-free marker events to $HERMES_HOME/logs/memory_feedback.jsonl.
+        """
+        try:
+            from plugins.memory.chromadb.g1b_observability import (
+                append_feedback_event,
+                extract_correction_markers,
+                feedback_path_for_home,
+            )
+
+            markers = extract_correction_markers(message or "")
+            if not markers:
+                return
+            platform = str(kwargs.get("platform") or self._platform or "cli")
+            gateway_session_key = kwargs.get("gateway_session_key", self._gateway_session_key)
+            path = feedback_path_for_home(self._hermes_home)
+            for marker in markers:
+                append_feedback_event(
+                    path,
+                    event_type="correction_marker",
+                    session_id=self._session_id,
+                    platform=platform,
+                    gateway_session_key=gateway_session_key,
+                    labels=[str(marker.get("label") or "")],
+                    context_sha256=str(marker.get("span_sha256") or ""),
+                    marker_start=marker.get("start"),
+                    marker_end=marker.get("end"),
+                )
+        except Exception as e:
+            logger.debug("ChromaDB G1B correction marker feedback failed: %s", e)
+
     # -- Delegation hook ----------------------------------------------------
 
     def on_delegation(self, task: str, result: str, *,

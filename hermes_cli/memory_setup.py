@@ -449,6 +449,38 @@ def cmd_status(args) -> None:
     print()
 
 
+def cmd_receipts(args) -> None:
+    """Read-only summary of local boot synthesis receipts."""
+    import json
+    from hermes_constants import get_hermes_home
+    from plugins.memory.chromadb.g1b_observability import (
+        boot_receipt_path_for_home,
+        read_boot_receipts,
+        summarize_boot_receipts,
+    )
+
+    path = boot_receipt_path_for_home(get_hermes_home())
+    raw_limit = getattr(args, "limit", 100)
+    limit = 100 if raw_limit is None else max(0, int(raw_limit))
+    records = read_boot_receipts(path).tail(limit)
+    summary = summarize_boot_receipts(records)
+    if getattr(args, "json", False):
+        print(json.dumps(summary, sort_keys=True, indent=2))
+        return
+
+    print("\nBoot synthesis receipts")
+    print("────────────────────────────────────────")
+    print(f"  path: {path}")
+    print(f"  receipt_count: {summary['receipt_count']}")
+    print(f"  malformed_count: {summary['malformed_count']}")
+    print(f"  fallback_count: {summary['fallback_count']}")
+    print(f"  latency_ms: {summary['latency_ms']}")
+    print(f"  models: {summary['models']}")
+    print(f"  sources: {summary['sources']}")
+    print(f"  durability: {summary['durability']}")
+    print()
+
+
 # ---------------------------------------------------------------------------
 # Router
 # ---------------------------------------------------------------------------
@@ -460,5 +492,7 @@ def memory_command(args) -> None:
         cmd_setup(args)
     elif sub == "status":
         cmd_status(args)
+    elif sub == "receipts":
+        cmd_receipts(args)
     else:
         cmd_status(args)
