@@ -2105,6 +2105,9 @@ class AIAgent:
                             "generated_prompt_enabled": bool(
                                 (getattr(self, "_memory_generated_prompt_cfg", {}) or {}).get("enabled", False)
                             ),
+                            "boot_synthesis_enabled": bool(
+                                _mem_cfg_for_policy.get("boot_synthesis_enabled", True)
+                            ),
                         }
                         # Thread session title for memory provider scoping
                         # (e.g. honcho uses this to derive chat-scoped session keys)

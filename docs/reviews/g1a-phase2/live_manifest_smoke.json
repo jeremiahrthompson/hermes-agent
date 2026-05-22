@@ -1,0 +1,16 @@
+{
+  "block_chars": 629,
+  "collection_count": 2316,
+  "dropped_duplicate_count": 7,
+  "fallback_path_taken": false,
+  "fallback_reason": null,
+  "latency_ms": 6206,
+  "memory_user_sha_unchanged": true,
+  "model": "qwen2.5:7b",
+  "ok": true,
+  "receipt_fields_present": true,
+  "receipt_has_gateway_session_key": true,
+  "receipt_path": "/Users/jeremiah/.hermes/logs/boot_synthesis.jsonl",
+  "selected_ids_count": 8,
+  "selected_user_durable": true
+}

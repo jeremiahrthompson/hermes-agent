@@ -1,0 +1,25 @@
+{
+  "available": true,
+  "dedup": 31,
+  "filtered": 38,
+  "latency_ms": 6434,
+  "memory": 30,
+  "out_chars": 731,
+  "out_preview": "<memory-profile source=\"chromadb\" degraded=\"false\">\n-> Prefers phased autonomy and reusable systems.\n-> Uses durable artifacts with custody+hashes.\n-> Prefers Codex GPT-5.5 via OpenAI Codex OAuth/Max for subagent/code-review lanes.\n-> No additional human-in-the-loop approval needed after dual review in Atlas/IGV tasks if independent reviewers agree.\n-> Wants project workflow/process names to explicitly identify the two-frontier-lab pattern.\n-> Does not want expensive models (especially Claude/Op",
+  "prompt_chars": 2915,
+  "prompt_preview": "Synthesize a concise Hermes boot memory profile from these Chroma facts. Return only a <memory-profile source=\"chromadb\" degraded=\"false\"> block with at most 8 short bullet lines of the form - > \"fact\". Keep total output <= 2200 characters. Prefer durable USER facts. Do not include PR numbers, commit SHAs, task progress, or transient state.\n[\n  {\n    \"id\": \"user_0d52f84a6936e71b\",\n    \"target\": \"user\",\n    \"durability\": \"durable\",\n    \"score\": 0.7287,\n    \"content\": \"Prefers phased autonomy, reu",
+  "prompt_selected": 8,
+  "prompt_selected_ids": [
+    "user_0d52f84a6936e71b",
+    "user_b0a6fcded0a1df71",
+    "user_803a09deeea890b7",
+    "user_c04c4857e69bfe76",
+    "user_3e2acef423c3f787",
+    "user_c74db9d83354be44",
+    "user_2328d87fc3336815",
+    "user_04b0619063cbe48f"
+  ],
+  "selected": 31,
+  "synth_ok": true,
+  "user": 20
+}

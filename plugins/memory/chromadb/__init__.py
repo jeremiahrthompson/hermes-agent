@@ -27,6 +27,7 @@ import json
 import logging
 import threading
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from agent.memory_provider import MemoryProvider
@@ -148,10 +149,14 @@ class ChromaDBMemoryProvider(MemoryProvider):
         self._agent_name = "rilo"
         self._team_context = ""
 
-        # Scoring weights (set from config during initialize)
-        self._w_sim = 0.5
-        self._w_rec = 0.3
-        self._w_imp = 0.2
+        # Scoring weights (G1A v1 salience formula; config fields are kept for
+        # backward-compatible chromadb.json parsing but no longer override the
+        # contract weights).
+        self._w_sim = 0.35
+        self._w_rec = 0.25
+        self._w_source = 0.20
+        self._w_imp = 0.15
+        self._w_durability = 0.05
 
         # Threading
         self._prefetch_result = ""
@@ -171,6 +176,10 @@ class ChromaDBMemoryProvider(MemoryProvider):
         self._prompt_source: str = "legacy"
         self._generated_profile_enabled: bool = False
         self._agent_context: str = "primary"
+        self._boot_synthesis_enabled: bool = True
+        self._platform: str = "cli"
+        self._gateway_session_key: Optional[str] = None
+        self._boot_receipt_guarded: set[str] = set()
 
     @property
     def name(self) -> str:
@@ -237,6 +246,8 @@ class ChromaDBMemoryProvider(MemoryProvider):
             self._session_id = session_id
             self._hermes_home = kwargs.get("hermes_home", "")
             self._agent_name = kwargs.get("agent_identity", "rilo")
+            self._platform = str(platform or "cli")
+            self._gateway_session_key = kwargs.get("gateway_session_key")
             # Phase 1 transport: core tells the plugin which prompt-source
             # mode is active and whether generated profile is enabled, via
             # initialize kwargs.  The plugin must not import core config.
@@ -244,6 +255,9 @@ class ChromaDBMemoryProvider(MemoryProvider):
             self._prompt_source = str(kwargs.get("prompt_source", "legacy") or "legacy")
             self._generated_profile_enabled = bool(
                 kwargs.get("generated_prompt_enabled", False)
+            )
+            self._boot_synthesis_enabled = bool(
+                kwargs.get("boot_synthesis_enabled", True)
             )
 
             # Load config
@@ -254,9 +268,11 @@ class ChromaDBMemoryProvider(MemoryProvider):
                 self._config = ChromaDBConfig()
 
             self._config.agent_name = self._agent_name
-            self._w_sim = self._config.similarity_weight
-            self._w_rec = self._config.recency_weight
-            self._w_imp = self._config.importance_weight
+            self._w_sim = 0.35
+            self._w_rec = 0.25
+            self._w_source = 0.20
+            self._w_imp = 0.15
+            self._w_durability = 0.05
 
             # Init ChromaDB client
             self._init_client()
@@ -362,6 +378,8 @@ class ChromaDBMemoryProvider(MemoryProvider):
         modes (plan §"Generated Prompt Block Contract").
         """
         if self._cron_skipped or not self._available:
+            if not self._cron_skipped and not self._available:
+                self._append_boot_unavailable_receipt("chroma_unreachable")
             return ""
 
         parts = []
@@ -396,7 +414,7 @@ class ChromaDBMemoryProvider(MemoryProvider):
             return False
         return True
 
-    def _search_for_generated(self, target: str) -> List[Dict[str, Any]]:
+    def _search_for_generated(self, target: str, *, legacy_pre_g1a: bool = False) -> List[Dict[str, Any]]:
         """Run a single ``_query()`` for the target and return ranked facts.
 
         Tests monkeypatch ``_query``/``_embed`` directly on the provider
@@ -427,14 +445,14 @@ class ChromaDBMemoryProvider(MemoryProvider):
             logger.debug("ChromaDB generated profile query for %s failed: %s", target, e)
             raise
         formatted = self._format_results(raw)
-        return rank_facts(formatted, min_confidence=gp.min_confidence)
+        return rank_facts(formatted, min_confidence=gp.min_confidence, legacy_pre_g1a=legacy_pre_g1a)
 
-    def _build_generated_profile_block(self) -> str:
-        """Generate, cache, and (optionally) return the ``<memory-profile>`` block.
+    def _build_legacy_generated_profile_block(self) -> str:
+        """Pre-G1A deterministic generated-profile path.
 
-        Returns empty string when the generated path should not run or
-        when generation fails — never raises.  Cache writes happen even in
-        ``shadow`` mode; cache reads/fallback are wired in Phase 2.
+        The G1A kill switch must be bit-identical to this path. Keep this
+        method side-effect-compatible with the previous implementation (cache
+        writes only; no boot-synthesis receipt decisions here).
         """
         if not self._generated_profile_should_run():
             return ""
@@ -448,8 +466,8 @@ class ChromaDBMemoryProvider(MemoryProvider):
 
             gp = self._config.generated_profile  # type: ignore[union-attr]
 
-            user_facts = self._search_for_generated("user")
-            memory_facts = self._search_for_generated("memory")
+            user_facts = self._search_for_generated("user", legacy_pre_g1a=True)
+            memory_facts = self._search_for_generated("memory", legacy_pre_g1a=True)
 
             collection_names = sorted((self._config.collections or {}).values())  # type: ignore[union-attr]
             selected_ids = [f.get("id", "") for f in user_facts + memory_facts]
@@ -494,12 +512,163 @@ class ChromaDBMemoryProvider(MemoryProvider):
                 return block
             return ""
         except Exception as e:
-            # Any failure — embeddings unreachable, query backend down,
-            # rendering error — downgrades the generated path to empty.
-            # Legacy / team-knowledge text in system_prompt_block is
-            # unaffected.
             logger.debug("ChromaDB generated profile failed: %s — degrading", e)
             return ""
+
+    def _append_boot_synthesis_receipt(self, receipt: Dict[str, Any]) -> None:
+        from plugins.memory.chromadb.g1a import BootSynthesisReceiptWriter
+
+        if not self._hermes_home:
+            return
+        writer = BootSynthesisReceiptWriter(self._hermes_home)
+        guard = f"{self._session_id}:chromadb:boot"
+        if guard in self._boot_receipt_guarded:
+            return
+        self._boot_receipt_guarded.add(guard)
+        writer.append_once(receipt, guard_key=guard)
+
+    def _append_boot_unavailable_receipt(self, reason: str) -> None:
+        """Append the required one-per-boot receipt when Chroma is unavailable."""
+        if (
+            not self._generated_profile_enabled
+            or self._prompt_source == "legacy"
+            or self._agent_context in ("cron", "subagent", "flush")
+            or not self._boot_synthesis_enabled
+        ):
+            return
+        from plugins.memory.chromadb import g1a
+
+        home = self._hermes_home or str(Path.home() / ".hermes")
+        writer = g1a.BootSynthesisReceiptWriter(home)
+        receipt = writer.base_receipt(
+            session_id=self._session_id,
+            platform=self._platform,
+            gateway_session_key=self._gateway_session_key,
+        )
+        receipt.update({
+            "query_strings": [],
+            "collections_searched": ["agent_memories"],
+            "candidates": [],
+            "selected_ids": [],
+            "dropped_ids": [],
+            "pre_dedup_count": 0,
+            "post_dedup_count": 0,
+            "model": g1a.SYNTHESIS_MODEL,
+            "input_chars": 0,
+            "output_chars": 0,
+            "latency_ms": 0,
+            "fallback_path_taken": True,
+            "fallback_reason": reason,
+            "output_sha256": g1a.sha256_text(""),
+            "previous_block_sha256": g1a.previous_receipt_info(home)[0],
+            "diff_summary": None,
+            "output_text_preview": "",
+        })
+        self._append_boot_synthesis_receipt(receipt)
+
+    def _build_generated_profile_block(self) -> str:
+        """Generate the G1A synthesized boot block with receipt and fallback."""
+        if not self._generated_profile_should_run():
+            return ""
+
+        from plugins.memory.chromadb import g1a
+
+        started = time.time()
+        writer = g1a.BootSynthesisReceiptWriter(self._hermes_home or str(Path.home() / ".hermes"))
+        receipt = writer.base_receipt(
+            session_id=self._session_id,
+            platform=self._platform,
+            gateway_session_key=self._gateway_session_key,
+        )
+        receipt.update({
+            "query_strings": [],
+            "collections_searched": ["agent_memories"],
+            "candidates": [],
+            "selected_ids": [],
+            "dropped_ids": [],
+            "pre_dedup_count": 0,
+            "post_dedup_count": 0,
+            "model": g1a.SYNTHESIS_MODEL,
+            "input_chars": 0,
+            "output_chars": 0,
+            "latency_ms": 0,
+            "fallback_path_taken": False,
+            "fallback_reason": None,
+            "output_sha256": g1a.sha256_text(""),
+            "previous_block_sha256": None,
+            "diff_summary": None,
+        })
+
+        def _finish(block: str, *, fallback: bool, reason: Optional[str], model: str) -> str:
+            prev_sha, prev_preview = g1a.previous_receipt_info(self._hermes_home or str(Path.home() / ".hermes"))
+            receipt.update({
+                "model": model,
+                "output_chars": len(block or ""),
+                "latency_ms": int((time.time() - started) * 1000),
+                "fallback_path_taken": bool(fallback),
+                "fallback_reason": reason,
+                "output_sha256": g1a.sha256_text(block or ""),
+                "previous_block_sha256": prev_sha,
+                "diff_summary": g1a.diff_summary(prev_preview, block or ""),
+                "output_text": block or "",
+                "output_text_preview": (block or "")[:1000],
+            })
+            self._append_boot_synthesis_receipt(receipt)
+            return block
+
+        if not self._boot_synthesis_enabled:
+            legacy = self._build_legacy_generated_profile_block()
+            return _finish(legacy, fallback=True, reason="kill_switch_off", model="legacy")
+
+        try:
+            gp = self._config.generated_profile  # type: ignore[union-attr]
+            receipt["query_strings"] = [gp.user_query, gp.memory_query]
+            user_facts = self._search_for_generated("user")
+            memory_facts = self._search_for_generated("memory")
+            candidates = user_facts + memory_facts
+            scored = g1a.score_results(candidates)
+            filtered, dropped_filter = g1a.filter_candidates(scored)
+            deduped, dropped_dedup = g1a.deduplicate_candidates(filtered, embed_fn=self._embed)
+            receipt.update({
+                "pre_dedup_count": len(filtered),
+                "post_dedup_count": len(deduped),
+                "candidates": [g1a.candidate_receipt(c) for c in scored],
+                "dropped_ids": dropped_filter + dropped_dedup,
+            })
+            selected_user = [c for c in deduped if (c.get("metadata") or {}).get("target") == "user"]
+            selected_memory = [c for c in deduped if (c.get("metadata") or {}).get("target") != "user"]
+            selected = selected_user + selected_memory
+            prompt_selected = g1a.select_synthesis_candidates(selected, limit=8)
+            prompt_selected_ids = {c.get("id", "") for c in prompt_selected}
+            over_budget = [g1a._drop(c, "over_budget") for c in selected if c.get("id", "") not in prompt_selected_ids]
+            receipt["dropped_ids"] = receipt["dropped_ids"] + over_budget
+            receipt["selected_ids"] = [c.get("id", "") for c in prompt_selected]
+            if not prompt_selected:
+                legacy = self._build_legacy_generated_profile_block()
+                return _finish(legacy, fallback=True, reason="exception", model=g1a.SYNTHESIS_MODEL)
+            prompt = g1a.build_synthesis_prompt(prompt_selected, max_chars=gp.max_memory_chars)
+            receipt["input_chars"] = len(prompt)
+            block = g1a.synthesize_with_ollama(prompt=prompt)
+            block = g1a.enforce_budget(block, gp.max_memory_chars)
+            if self._prompt_source == "shadow":
+                return _finish("", fallback=False, reason=None, model=g1a.SYNTHESIS_MODEL)
+            return _finish(block, fallback=False, reason=None, model=g1a.SYNTHESIS_MODEL)
+        except g1a.ModelTimeout:
+            legacy = self._build_legacy_generated_profile_block()
+            return _finish(legacy, fallback=True, reason="timeout", model=g1a.SYNTHESIS_MODEL)
+        except g1a.EmptyOutput:
+            legacy = self._build_legacy_generated_profile_block()
+            return _finish(legacy, fallback=True, reason="empty_output", model=g1a.SYNTHESIS_MODEL)
+        except g1a.ModelUnavailable:
+            legacy = self._build_legacy_generated_profile_block()
+            return _finish(legacy, fallback=True, reason="model_unreachable", model=g1a.SYNTHESIS_MODEL)
+        except g1a.UnsafeOutput:
+            legacy = self._build_legacy_generated_profile_block()
+            return _finish(legacy, fallback=True, reason="unsafe_output", model=g1a.SYNTHESIS_MODEL)
+        except Exception as e:
+            logger.debug("G1A boot synthesis failed: %s — using legacy path", e)
+            legacy = self._build_legacy_generated_profile_block()
+            return _finish(legacy, fallback=True, reason="exception", model=g1a.SYNTHESIS_MODEL)
 
     # -- Prefetch (semantic recall) -----------------------------------------
 
@@ -1350,46 +1519,15 @@ class ChromaDBMemoryProvider(MemoryProvider):
         return results
 
     def _score_results(self, results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Compute composite scores: 0.5*similarity + 0.3*recency + 0.2*importance."""
-        now = time.time()
-        thirty_days = 30 * 24 * 3600
+        """Compute G1A v1 composite scores.
 
-        scored = []
-        for r in results:
-            distance = r.get("distance", 1.0)
-            meta = r.get("metadata", {})
+        Formula: 0.35 semantic + 0.25 recency + 0.20 source_quality
+        + 0.15 importance + 0.05 durability. Recency retains the existing
+        30-day linear window in plugins.memory.chromadb.g1a.
+        """
+        from plugins.memory.chromadb.g1a import score_results
 
-            similarity = 1.0 / (1.0 + distance)
-
-            stored_at = meta.get("stored_at", now)
-            try:
-                stored_at = float(stored_at)
-            except (TypeError, ValueError):
-                stored_at = now
-            age = max(0, now - stored_at)
-            recency = max(0.0, 1.0 - (age / thirty_days))
-
-            importance = 0.5
-            try:
-                importance = float(meta.get("importance", 0.5))
-            except (TypeError, ValueError):
-                pass
-            importance = max(0.0, min(1.0, importance))
-
-            composite = (
-                self._w_sim * similarity
-                + self._w_rec * recency
-                + self._w_imp * importance
-            )
-
-            entry = dict(r)
-            entry["similarity"] = similarity
-            entry["recency"] = recency
-            entry["importance"] = importance
-            entry["composite_score"] = composite
-            scored.append(entry)
-
-        return scored
+        return score_results(results, now=time.time())
 
     # -- Helpers ------------------------------------------------------------
 

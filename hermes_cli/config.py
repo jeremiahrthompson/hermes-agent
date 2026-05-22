@@ -1155,6 +1155,9 @@ DEFAULT_CONFIG = {
         # prompt_source == "legacy"; ignored in shadow / provider_*
         # modes (those govern suppression themselves).
         "suppress_builtin_when_external": False,
+        # G1A boot synthesis kill switch. On by default; set false to return
+        # to the pre-G1A non-synthesized Chroma provider block on next boot.
+        "boot_synthesis_enabled": True,
         # Generated profile (vector-memory-derived prompt block).
         # Lives behind prompt_source != "legacy" and is rendered by
         # the active memory provider (e.g. ChromaDB). Core only routes
