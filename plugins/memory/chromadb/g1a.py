@@ -515,9 +515,9 @@ class BootSynthesisReceiptWriter:
             "gateway_session_key": gateway_session_key,
         }
 
-    def append_once(self, receipt: Dict[str, Any], *, guard_key: str) -> None:
+    def append_once(self, receipt: Dict[str, Any], *, guard_key: str) -> bool:
         if guard_key in self._guards:
-            return
+            return False
         self._guards.add(guard_key)
         safe = _strip_vectors(dict(receipt or {}))
         safe.setdefault("fallback_reason", None)
@@ -531,3 +531,11 @@ class BootSynthesisReceiptWriter:
                 f.write(json.dumps(safe, sort_keys=True, ensure_ascii=False, default=str) + "\n")
         except Exception as e:
             logger.warning("Failed to append G1A boot synthesis receipt: %s", e)
+            return False
+        try:
+            from plugins.memory.chromadb.g1b_observability import append_feedback_events_from_boot_receipt
+
+            append_feedback_events_from_boot_receipt(self.hermes_home, safe)
+        except Exception as e:
+            logger.debug("Failed to append G1B boot feedback events: %s", e)
+        return True
